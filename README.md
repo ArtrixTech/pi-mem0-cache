@@ -27,6 +27,10 @@ The extension wraps `globalThis.fetch` inside the pi process and transparently i
 
 All memories seen in any API response are harvested into the local corpus, so the fallback search gets richer the longer you use it.
 
+**Upstream bug workaround** ([mem0ai/mem0#6168](https://github.com/mem0ai/mem0/issues/6168))
+
+The pi mem0 plugin's `global` scope is asymmetric: writes store `app_id: null`, reads filter `app_id: "*"`, and mem0's `*` wildcard matches only non-null values — so global memories are permanently unreachable. This extension normalizes read requests before they hit the API: entity filters (`user_id`/`agent_id`/`app_id`/`run_id`) whose value is `"*"` are dropped, restoring the intended "unconstrained" semantics. Normalization happens before cache-key computation, so wildcard and non-wildcard variants of the same read share one cache entry.
+
 ## Install
 
 Add to `~/.pi/agent/settings.json`:

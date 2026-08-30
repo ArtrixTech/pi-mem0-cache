@@ -1,6 +1,6 @@
 {
   "name": "pi-mem0-cache",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Pi extension that caches mem0 reads and falls back to a local memory store when the mem0 API is unavailable or over quota",
   "license": "MIT",
   "type": "module",

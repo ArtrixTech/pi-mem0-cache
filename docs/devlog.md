@@ -1,5 +1,15 @@
 # devlog
 
+## fix: normalize "*" entity filters — workaround for mem0ai/mem0#6168
+
+`<pending>` | 2026-08-30
+
+- **Changes**: `normalizeWildcardFilters` drops entity filters (`user_id`/`agent_id`/`app_id`/`run_id`) valued `"*"` from search/getAll request bodies before they hit the API; normalization precedes cache-key computation so variants share entries; v0.3.0.
+- **Reason**: user reported (via another agent) previously-written memories unreachable, get_all empty. Root cause confirmed upstream: plugin's global scope writes `app_id: null` but reads filter `app_id: "*"`, and mem0's `*` excludes null-valued records (documented; upstream issue #6168).
+- **Process**: verified against local store (`localWrites: 0` — extension never intercepted writes; two cached empty 200 responses were genuine API answers), probed cloud directly (429 quota), read plugin `scoping.ts` asymmetry, confirmed wildcard semantics in mem0 docs.
+- **Result**: 29/29 tests pass (4 new), typecheck clean.
+- **Notes**: project/session scopes are symmetric and unaffected; cross-project invisibility of project-scope memories is intended scoping, not a bug.
+
 ## docs: adopt artrix-skills AGENTS.md, add Architecture.md and publish metadata
 
 `<pending>` | 2026-08-30

@@ -309,6 +309,37 @@ function applyLocalWrite(store: Store, req: ClassifiedRequest): Record<string, u
 // ---------------------------------------------------------------------------
 // Fetch interceptor
 
+const ENTITY_FILTER_KEYS = new Set(["user_id", "agent_id", "app_id", "run_id"]);
+
+/**
+ * Workaround for mem0ai/mem0#6168: mem0's "*" wildcard matches only non-null
+ * values, so the pi mem0 plugin's global-scope reads (filters.app_id = "*")
+ * can never see global-scope writes (stored with app_id = null). Dropping the
+ * "*" entity filter restores the intended "unconstrained" semantics.
+ */
+export function normalizeWildcardFilters(bodyText: string | undefined): string | undefined {
+  if (!bodyText) return bodyText;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(bodyText);
+  } catch {
+    return bodyText;
+  }
+  if (typeof parsed !== "object" || parsed === null) return bodyText;
+  const body = parsed as Record<string, unknown>;
+  const filters = body.filters;
+  if (typeof filters !== "object" || filters === null || Array.isArray(filters)) return bodyText;
+  const f = filters as Record<string, unknown>;
+  let changed = false;
+  for (const key of Object.keys(f)) {
+    if (ENTITY_FILTER_KEYS.has(key) && f[key] === "*") {
+      delete f[key];
+      changed = true;
+    }
+  }
+  return changed ? JSON.stringify(body) : bodyText;
+}
+
 export interface CapturedAuth {
   origin: string;
   headers: Record<string, string>;
@@ -353,7 +384,7 @@ export function createInterceptor(
   const { store, save, ttlMs, onFallback } = opts;
 
   const interceptor = async (input: FetchInput, init?: RequestInit): Promise<Response> => {
-    const req = classify(input, init);
+    let req = classify(input, init);
     if (!req || req.kind === "other") {
       return fetchImpl(input as string | URL | Request, init);
     }
@@ -362,6 +393,14 @@ export function createInterceptor(
       const headers = extractHeaders(input, init);
       if (headers?.authorization) {
         opts.authRef.current = { origin: req.url.origin, headers };
+      }
+    }
+
+    if (req.kind === "read-search" || req.kind === "read-getall") {
+      const normalized = normalizeWildcardFilters(req.bodyText);
+      if (normalized !== undefined && normalized !== req.bodyText) {
+        req = { ...req, bodyText: normalized };
+        init = { ...init, body: normalized };
       }
     }
 

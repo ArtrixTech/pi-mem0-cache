@@ -383,3 +383,60 @@ describe("auto-sync trigger", () => {
     expect(JSON.parse(uploaded[0])).toMatchObject({ user_id: "u1", messages: [{ role: "user", content: "remember this" }] });
   });
 });
+
+describe("wildcard filter normalization (mem0ai/mem0#6168)", () => {
+  it("drops app_id='*' from search filters before hitting the API", async () => {
+    const store = makeStore();
+    const seen: string[] = [];
+    const fetchImpl = (async (_u: unknown, init?: RequestInit) => {
+      seen.push(String(init?.body));
+      return okJson({ results: [] });
+    }) as typeof fetch;
+    const fetcher = createInterceptor(fetchImpl, { store, save: () => {}, ttlMs: 60_000 });
+    await fetcher(SEARCH_URL, {
+      method: "POST",
+      body: JSON.stringify({ query: "q", filters: { user_id: "artrix", app_id: "*" } }),
+    });
+    const sent = JSON.parse(seen[0]) as { filters: Record<string, string> };
+    expect(sent.filters).toEqual({ user_id: "artrix" });
+  });
+
+  it("drops run_id='*' from getAll filters; keeps real values untouched", async () => {
+    const store = makeStore();
+    const seen: string[] = [];
+    const fetchImpl = (async (_u: unknown, init?: RequestInit) => {
+      seen.push(String(init?.body));
+      return okJson({ results: [], count: 0 });
+    }) as typeof fetch;
+    const fetcher = createInterceptor(fetchImpl, { store, save: () => {}, ttlMs: 60_000 });
+    await fetcher(GETALL_URL, {
+      method: "POST",
+      body: JSON.stringify({ filters: { user_id: "artrix", app_id: "proj", run_id: "*" } }),
+    });
+    const sent = JSON.parse(seen[0]) as { filters: Record<string, string> };
+    expect(sent.filters).toEqual({ user_id: "artrix", app_id: "proj" });
+  });
+
+  it("wildcard and non-wildcard variants of the same logical read share a cache entry", async () => {
+    const store = makeStore();
+    let calls = 0;
+    const fetchImpl = (async () => {
+      calls++;
+      return okJson({ results: [] });
+    }) as typeof fetch;
+    const fetcher = createInterceptor(fetchImpl, { store, save: () => {}, ttlMs: 60_000 });
+    await fetcher(SEARCH_URL, { method: "POST", body: JSON.stringify({ query: "q", filters: { user_id: "u", app_id: "*" } }) });
+    await fetcher(SEARCH_URL, { method: "POST", body: JSON.stringify({ query: "q", filters: { user_id: "u" } }) });
+    expect(calls).toBe(1);
+    expect(store.stats.hits).toBe(1);
+  });
+
+  it("normalizeWildcardFilters leaves non-wildcard and non-JSON bodies unchanged", async () => {
+    const { normalizeWildcardFilters } = await import("../src/index.ts");
+    const plain = JSON.stringify({ query: "q", filters: { user_id: "u", app_id: "proj" } });
+    expect(normalizeWildcardFilters(plain)).toBe(plain);
+    expect(normalizeWildcardFilters("not json")).toBe("not json");
+    expect(normalizeWildcardFilters(undefined)).toBeUndefined();
+    expect(normalizeWildcardFilters(JSON.stringify({ filters: ["not-an-object"] }))).toBe(JSON.stringify({ filters: ["not-an-object"] }));
+  });
+});
