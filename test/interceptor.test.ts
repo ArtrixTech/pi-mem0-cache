@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   classify,
   createInterceptor,
+  createSyncRunner,
   emptyStore,
   harvestMemories,
   searchLocal,
@@ -234,5 +235,151 @@ describe("non-mem0 traffic", () => {
     await fetcher("https://example.com/api");
     expect(calls).toBe(1);
     expect(store.stats.passthroughs).toBe(0);
+  });
+});
+
+describe("sync runner", () => {
+  const AUTH = { origin: "https://api.mem0.ai", headers: { authorization: "Token k" } };
+
+  function localMemory(store: Store, id: string, memory: string, addPayload?: Record<string, unknown>) {
+    const now = new Date().toISOString();
+    store.memories[id] = { id, memory, created_at: now, updated_at: now, source: "local", addPayload };
+  }
+
+  it("uploads pending local memories with the original scope payload, marks observed", async () => {
+    const store = makeStore();
+    localMemory(store, "l1", "user likes tea", { user_id: "u1", app_id: "a1" });
+    const seen: { url: string; body: string }[] = [];
+    const fetchImpl = (async (url: unknown, init?: RequestInit) => {
+      seen.push({ url: String(url), body: String(init?.body) });
+      return okJson({ results: [] });
+    }) as typeof fetch;
+    const syncer = createSyncRunner({ store, save: () => {}, fetchImpl, getAuth: () => AUTH });
+    const r = await syncer.sync();
+    expect(r).toMatchObject({ uploaded: 1, failed: 0, pending: 0 });
+    expect(seen[0].url).toBe(ADD_URL);
+    const sent = JSON.parse(seen[0].body) as { user_id?: string; app_id?: string; messages?: { content: string }[] };
+    expect(sent.user_id).toBe("u1");
+    expect(sent.app_id).toBe("a1");
+    expect(sent.messages?.[0].content).toBe("user likes tea");
+    expect(store.memories.l1.source).toBe("observed");
+    expect(store.memories.l1.addPayload).toBeUndefined();
+  });
+
+  it("purges local memories deleted before first sync (never reached cloud)", async () => {
+    const store = makeStore();
+    localMemory(store, "l1", "temp");
+    store.memories.l1.deleted = true;
+    const fetchImpl = (async () => okJson({})) as typeof fetch;
+    const syncer = createSyncRunner({ store, save: () => {}, fetchImpl, getAuth: () => AUTH });
+    await syncer.sync();
+    expect(store.memories.l1).toBeUndefined();
+  });
+
+  it("backs off on failure and skips until backoff expires; force bypasses", async () => {
+    const store = makeStore();
+    localMemory(store, "l1", "fact");
+    let calls = 0;
+    const failing = (async () => {
+      calls++;
+      return okJson({ error: "quota" }, 429);
+    }) as typeof fetch;
+    const syncer = createSyncRunner({ store, save: () => {}, fetchImpl: failing, getAuth: () => AUTH, backoffMs: 60_000 });
+    const r1 = await syncer.sync();
+    expect(r1.failed).toBe(1);
+    expect(store.syncState.backoffUntil).toBeGreaterThan(Date.now());
+
+    const r2 = await syncer.sync();
+    expect(r2.skipped).toBe(true);
+    expect(calls).toBe(1);
+
+    const r3 = await syncer.sync(true);
+    expect(r3.skipped).toBe(false);
+    expect(calls).toBe(2);
+  });
+
+  it("skips when no auth captured yet", async () => {
+    const store = makeStore();
+    localMemory(store, "l1", "fact");
+    const syncer = createSyncRunner({ store, save: () => {}, fetchImpl: (async () => okJson({})) as typeof fetch, getAuth: () => undefined });
+    expect((await syncer.sync()).skipped).toBe(true);
+  });
+
+  it("maybeSync dedupes concurrent runs and returns null when idle", async () => {
+    const store = makeStore();
+    const syncer = createSyncRunner({ store, save: () => {}, fetchImpl: (async () => okJson({})) as typeof fetch, getAuth: () => AUTH });
+    expect(syncer.maybeSync()).toBeNull();
+    localMemory(store, "l1", "fact");
+    const p1 = syncer.maybeSync();
+    const p2 = syncer.maybeSync();
+    expect(p1).toBe(p2);
+    await p1;
+    expect(syncer.pendingCount()).toBe(0);
+  });
+});
+
+describe("auto-sync trigger", () => {
+  it("successful read triggers onPassthroughSuccess and captures auth", async () => {
+    const store = makeStore();
+    let triggered = 0;
+    const authRef: { current?: import("../src/index.ts").CapturedAuth } = {};
+    const fetchImpl = (async () => okJson({ results: [] })) as typeof fetch;
+    const fetcher = createInterceptor(fetchImpl, {
+      store,
+      save: () => {},
+      ttlMs: 60_000,
+      authRef,
+      onPassthroughSuccess: () => {
+        triggered++;
+      },
+    });
+    await fetcher(SEARCH_URL, {
+      method: "POST",
+      headers: { Authorization: "Token abc" },
+      body: JSON.stringify({ query: "x" }),
+    });
+    expect(triggered).toBe(1);
+    expect(authRef.current?.headers.authorization).toBe("Token abc");
+    expect(authRef.current?.origin).toBe("https://api.mem0.ai");
+  });
+
+  it("end-to-end: local write during outage auto-uploads after API recovers", async () => {
+    const store = makeStore();
+    const authRef: { current?: import("../src/index.ts").CapturedAuth } = {};
+    let apiUp = false;
+    const uploaded: string[] = [];
+    const syncer = createSyncRunner({
+      store,
+      save: () => {},
+      fetchImpl: (async (url: unknown, init?: RequestInit) => {
+        uploaded.push(String(init?.body));
+        return okJson({ results: [] });
+      }) as typeof fetch,
+      getAuth: () => authRef.current,
+      backoffMs: 0,
+    });
+    const fetcher = createInterceptor(
+      (async (url: unknown) => {
+        if (!apiUp) return okJson({ error: "quota" }, 429);
+        return okJson({ results: [] });
+      }) as typeof fetch,
+      { store, save: () => {}, ttlMs: 60_000, authRef, onPassthroughSuccess: () => void syncer.maybeSync() },
+    );
+
+    // Outage: add falls back to local store.
+    await fetcher(ADD_URL, {
+      method: "POST",
+      headers: { Authorization: "Token abc" },
+      body: JSON.stringify({ user_id: "u1", messages: [{ content: "remember this" }] }),
+    });
+    expect(syncer.pendingCount()).toBe(1);
+
+    // API recovers: next successful read triggers auto-sync.
+    apiUp = true;
+    await fetcher(...searchRequest("anything"));
+    await new Promise((r) => setImmediate(r)); // let the fire-and-forget sync finish
+    expect(syncer.pendingCount()).toBe(0);
+    expect(uploaded).toHaveLength(1);
+    expect(JSON.parse(uploaded[0])).toMatchObject({ user_id: "u1", messages: [{ role: "user", content: "remember this" }] });
   });
 });

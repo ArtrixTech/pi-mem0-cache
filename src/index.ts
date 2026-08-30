@@ -35,13 +35,24 @@ export interface LocalMemory {
   updated_at: string;
   deleted?: boolean;
   source: "local" | "observed";
+  /** Original /v3/memories/add/ payload (minus `messages`) captured when the
+   *  write fell back locally — replayed verbatim on sync so scope params
+   *  (user_id, app_id, …) survive. */
+  addPayload?: Record<string, unknown>;
   [key: string]: unknown;
+}
+
+export interface SyncState {
+  backoffUntil?: number;
+  lastAttemptAt?: number;
+  lastResult?: string;
 }
 
 export interface Store {
   version: 1;
   cache: Record<string, CachedResponse>;
   memories: Record<string, LocalMemory>;
+  syncState: SyncState;
   stats: {
     hits: number;
     misses: number;
@@ -57,6 +68,7 @@ export function emptyStore(): Store {
     version: 1,
     cache: {},
     memories: {},
+    syncState: {},
     stats: { hits: 0, misses: 0, passthroughs: 0, staleServed: 0, fallbacks: 0, localWrites: 0 },
   };
 }
@@ -70,6 +82,7 @@ export function loadStore(path: string): Store {
       version: 1,
       cache: parsed.cache ?? {},
       memories: parsed.memories ?? {},
+      syncState: parsed.syncState ?? {},
       stats: { ...base.stats, ...(parsed.stats ?? {}) },
     };
   } catch {
@@ -244,9 +257,12 @@ function applyLocalWrite(store: Store, req: ClassifiedRequest): Record<string, u
   switch (req.kind) {
     case "write-add": {
       let contents: string[] = [];
+      let addPayload: Record<string, unknown> = {};
       try {
-        const body = JSON.parse(req.bodyText ?? "{}") as { messages?: { content?: string }[] };
-        contents = (body.messages ?? [])
+        const body = JSON.parse(req.bodyText ?? "{}") as { messages?: { content?: string }[] } & Record<string, unknown>;
+        const { messages, ...rest } = body;
+        addPayload = rest;
+        contents = (messages ?? [])
           .map((m) => m.content)
           .filter((c): c is string => typeof c === "string" && c.length > 0);
       } catch {
@@ -254,7 +270,7 @@ function applyLocalWrite(store: Store, req: ClassifiedRequest): Record<string, u
       }
       const memory = contents.join("\n") || "(empty)";
       const id = `local-${randomUUID()}`;
-      store.memories[id] = { id, memory, created_at: now, updated_at: now, source: "local" };
+      store.memories[id] = { id, memory, created_at: now, updated_at: now, source: "local", addPayload };
       return { message: "Memory stored locally (mem0 API unavailable).", id, status: "PENDING" };
     }
     case "write-update": {
@@ -293,11 +309,34 @@ function applyLocalWrite(store: Store, req: ClassifiedRequest): Record<string, u
 // ---------------------------------------------------------------------------
 // Fetch interceptor
 
+export interface CapturedAuth {
+  origin: string;
+  headers: Record<string, string>;
+}
+
+export function extractHeaders(input: FetchInput, init?: RequestInit): Record<string, string> | undefined {
+  const raw = init?.headers ?? (typeof input === "object" && "headers" in input ? (input as Request).headers : undefined);
+  if (!raw) return undefined;
+  const out: Record<string, string> = {};
+  try {
+    new Headers(raw as HeadersInit).forEach((value, key) => {
+      out[key] = value;
+    });
+  } catch {
+    return undefined;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
 export interface InterceptorOptions {
   store: Store;
   save: () => void;
   ttlMs: number;
   onFallback?: (reason: string) => void;
+  /** Shared cell the interceptor fills with the last seen mem0 auth headers. */
+  authRef?: { current?: CapturedAuth };
+  /** Called after any successful mem0 API response (read or write). */
+  onPassthroughSuccess?: () => void;
 }
 
 function jsonResponse(body: unknown, status = 200): Response {
@@ -319,6 +358,13 @@ export function createInterceptor(
       return fetchImpl(input as string | URL | Request, init);
     }
 
+    if (opts.authRef) {
+      const headers = extractHeaders(input, init);
+      if (headers?.authorization) {
+        opts.authRef.current = { origin: req.url.origin, headers };
+      }
+    }
+
     // -- Writes ---------------------------------------------------------------
     if (req.kind.startsWith("write-")) {
       if (req.kind === "write-other") return fetchImpl(input as string | URL | Request, init);
@@ -326,6 +372,7 @@ export function createInterceptor(
         const res = await fetchImpl(input as string | URL | Request, init);
         if (res.ok) {
           store.stats.passthroughs++;
+          opts.onPassthroughSuccess?.();
           return res;
         }
         store.stats.fallbacks++;
@@ -360,6 +407,7 @@ export function createInterceptor(
         store.cache[key] = { status: res.status, body, savedAt: Date.now() };
         harvestMemories(store, body);
         store.stats.passthroughs++;
+        opts.onPassthroughSuccess?.();
         save();
         return res;
       }
@@ -405,6 +453,104 @@ export function createInterceptor(
 }
 
 // ---------------------------------------------------------------------------
+// Sync: upload locally-stored memories once the API works again
+
+export interface SyncRunnerOptions {
+  store: Store;
+  save: () => void;
+  fetchImpl: typeof fetch;
+  getAuth: () => CapturedAuth | undefined;
+  onEvent?: (message: string) => void;
+  /** Backoff after a failed sync attempt (default 1h). */
+  backoffMs?: number;
+}
+
+export interface SyncResult {
+  uploaded: number;
+  failed: number;
+  skipped: boolean;
+  pending: number;
+}
+
+const DEFAULT_SYNC_BACKOFF_MS = 60 * 60 * 1000;
+
+export function createSyncRunner(opts: SyncRunnerOptions) {
+  const { store, save, fetchImpl, getAuth, onEvent } = opts;
+  const backoffMs = opts.backoffMs ?? DEFAULT_SYNC_BACKOFF_MS;
+  let inFlight: Promise<SyncResult> | null = null;
+
+  const pendingList = () => Object.values(store.memories).filter((m) => m.source === "local" && !m.deleted);
+
+  async function sync(force = false): Promise<SyncResult> {
+    // Locally-created memories deleted before ever syncing never reached the
+    // cloud — purge them outright.
+    for (const m of Object.values(store.memories)) {
+      if (m.source === "local" && m.deleted) delete store.memories[m.id];
+    }
+
+    const pending = pendingList();
+    const auth = getAuth();
+    if (pending.length === 0 || !auth) {
+      return { uploaded: 0, failed: 0, skipped: true, pending: pending.length };
+    }
+    const now = Date.now();
+    if (!force && store.syncState.backoffUntil && now < store.syncState.backoffUntil) {
+      return { uploaded: 0, failed: 0, skipped: true, pending: pending.length };
+    }
+    store.syncState.lastAttemptAt = now;
+
+    let uploaded = 0;
+    let failed = 0;
+    for (const m of pending) {
+      const payload = { ...(m.addPayload ?? {}), messages: [{ role: "user", content: m.memory }] };
+      try {
+        const res = await fetchImpl(`${auth.origin}/v3/memories/add/`, {
+          method: "POST",
+          headers: { ...auth.headers, "content-type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        if (res.ok) {
+          uploaded++;
+          harvestMemories(store, await res.text().catch(() => ""));
+          m.source = "observed";
+          delete m.addPayload;
+        } else {
+          failed++;
+          store.syncState.backoffUntil = Date.now() + backoffMs;
+          onEvent?.(`sync paused after HTTP ${res.status}; retrying after backoff`);
+          break;
+        }
+      } catch (err) {
+        failed++;
+        store.syncState.backoffUntil = Date.now() + backoffMs;
+        onEvent?.(`sync paused after error: ${err instanceof Error ? err.message : String(err)}`);
+        break;
+      }
+    }
+    store.syncState.lastResult = `uploaded ${uploaded}, failed ${failed}, pending ${pendingList().length}`;
+    save();
+    if (uploaded > 0 || failed > 0) {
+      onEvent?.(`sync: ${store.syncState.lastResult}`);
+    }
+    return { uploaded, failed, skipped: false, pending: pendingList().length };
+  }
+
+  /** Fire-and-forget; dedupes concurrent runs. Returns null when nothing to do. */
+  function maybeSync(): Promise<SyncResult> | null {
+    if (inFlight) return inFlight;
+    if (pendingList().length === 0) return null;
+    inFlight = sync(false)
+      .catch(() => ({ uploaded: 0, failed: 0, skipped: true, pending: pendingList().length }))
+      .finally(() => {
+        inFlight = null;
+      });
+    return inFlight;
+  }
+
+  return { sync, maybeSync, pendingCount: () => pendingList().length };
+}
+
+// ---------------------------------------------------------------------------
 // Extension entry
 
 export default function piMem0Cache(pi: ExtensionAPI): void {
@@ -414,29 +560,59 @@ export default function piMem0Cache(pi: ExtensionAPI): void {
   const save = makeSaver(store, storePath);
 
   const g = globalThis as { fetch?: typeof fetch & { [WRAPPED]?: boolean } };
+  const authRef: { current?: CapturedAuth } = {};
+  // Capture the original fetch BEFORE wrapping so the sync runner's replayed
+  // adds go straight to the network instead of re-entering the interceptor.
+  const realFetch = g.fetch;
+  const syncer = createSyncRunner({
+    store,
+    save,
+    fetchImpl: (...args: Parameters<typeof fetch>) => {
+      if (!realFetch) throw new Error("fetch unavailable");
+      return realFetch(...args);
+    },
+    getAuth: () => authRef.current,
+    onEvent: (msg) => console.warn(`[pi-mem0-cache] ${msg}`),
+  });
+
   if (typeof g.fetch === "function" && !g.fetch[WRAPPED]) {
     const wrapped = createInterceptor(g.fetch, {
       store,
       save,
       ttlMs,
+      authRef,
       onFallback: (reason) => console.warn(`[pi-mem0-cache] ${reason}`),
+      onPassthroughSuccess: () => {
+        void syncer.maybeSync();
+      },
     }) as typeof fetch & { [WRAPPED]?: boolean };
     wrapped[WRAPPED] = true;
     g.fetch = wrapped;
   }
 
   pi.registerCommand("mem0-cache", {
-    description: "mem0 read cache: /mem0-cache [stats|clear|clear-all|path]",
+    description: "mem0 read cache: /mem0-cache [stats|sync|clear|clear-all|path]",
     handler: async (args, ctx) => {
       const sub = (args ?? "").trim() || "stats";
       switch (sub) {
         case "stats": {
           const s = store.stats;
-          const localCount = Object.values(store.memories).filter((m) => m.source === "local" && !m.deleted).length;
+          const localCount = syncer.pendingCount();
+          const sync = store.syncState.lastResult ? ` | last sync: ${store.syncState.lastResult}` : "";
           ctx.ui.notify(
             `mem0-cache: ${Object.keys(store.cache).length} cached reads, ` +
-              `${localCount} local memories | hits ${s.hits}, misses ${s.misses}, ` +
-              `passthroughs ${s.passthroughs}, stale ${s.staleServed}, fallbacks ${s.fallbacks}, localWrites ${s.localWrites}`,
+              `${localCount} pending local memories | hits ${s.hits}, misses ${s.misses}, ` +
+              `passthroughs ${s.passthroughs}, stale ${s.staleServed}, fallbacks ${s.fallbacks}, localWrites ${s.localWrites}${sync}`,
+            "info",
+          );
+          break;
+        }
+        case "sync": {
+          const r = await syncer.sync(true);
+          ctx.ui.notify(
+            r.skipped
+              ? `mem0-cache sync: nothing to do (${r.pending} pending, ${authRef.current ? "backoff active or " : ""}${authRef.current ? "" : "no mem0 auth captured yet"})`
+              : `mem0-cache sync: uploaded ${r.uploaded}, failed ${r.failed}, pending ${r.pending}`,
             "info",
           );
           break;
@@ -456,7 +632,7 @@ export default function piMem0Cache(pi: ExtensionAPI): void {
           ctx.ui.notify(`mem0-cache store: ${storePath}`, "info");
           break;
         default:
-          ctx.ui.notify("usage: /mem0-cache [stats|clear|clear-all|path]", "warning");
+          ctx.ui.notify("usage: /mem0-cache [stats|sync|clear|clear-all|path]", "warning");
       }
     },
   });

@@ -16,8 +16,14 @@ The extension wraps `globalThis.fetch` inside the pi process and transparently i
 **Writes** (`add`, `update`, `delete`, `delete_all`)
 
 - Tried against the real API first. On success, behavior is unchanged.
-- On failure, the mutation is applied to the **local store** and a synthetic success response is returned, so no memory is lost while mem0 is unavailable.
-- Local writes are **not replayed** to mem0 later (deliberate: they stay searchable through the local fallback forever). The local store *wins* over observed remote copies for the same memory id.
+- On failure, the mutation is applied to the **local store** (with the original request payload, scope params included) and a synthetic success response is returned, so no memory is lost while mem0 is unavailable.
+
+**Auto-sync**
+
+- The moment *any* mem0 API call succeeds again (quota refilled, network back), all pending local memories are uploaded in the background via `/v3/memories/add/` — replayed with their **original scope payload** (`user_id`, `app_id`, …), so they land in the right scope.
+- Uploaded memories are marked `observed`; local copies that were deleted before ever syncing are purged.
+- Auth headers are captured transparently from the mem0 client's own requests — no configuration needed.
+- On failure mid-sync, the runner backs off for 1h before retrying. Force an immediate attempt with `/mem0-cache sync`.
 
 All memories seen in any API response are harvested into the local corpus, so the fallback search gets richer the longer you use it.
 
@@ -38,7 +44,8 @@ Restart pi. No configuration needed — it works alongside `@mem0/pi-agent-plugi
 ## Usage
 
 ```
-/mem0-cache stats       # cache size, local memories, hit/miss/fallback counters
+/mem0-cache stats       # cache size, pending local memories, counters, last sync result
+/mem0-cache sync        # force-upload pending local memories to mem0 now
 /mem0-cache clear       # wipe the read cache (keep local memories)
 /mem0-cache clear-all   # wipe everything
 /mem0-cache path        # show store location
@@ -54,13 +61,14 @@ TTL defaults to 24h; override with `MEM0_CACHE_TTL_MS`.
 
 - **Interception layer**: pi's `tool_call` hook can only block or mutate tool arguments — it cannot inject a synthetic successful result. The mem0 SDK resolves global `fetch` at call time, so wrapping `fetch` is the cleanest transparent seam: no patching `node_modules`, no local proxy process, survives plugin upgrades.
 - **TTL over write-invalidation**: mem0 search is semantic; results drift as memories are added. A 24h TTL is a simple, predictable freshness bound.
-- **No write replay**: when the API is down, failed writes are stored locally and exposed through the fallback search. Replaying them into mem0 later is intentionally out of scope.
+- **Auto-sync on first success**: the trigger for uploading pending local memories is any successful mem0 response — the earliest possible proof that quota/connectivity is back. Replays use the original add payload so scoping is preserved. Sync calls go through the *unwrapped* fetch, never re-entering the interceptor.
 
 ## Limitations
 
 - Local fallback search is keyword overlap, not semantic. It's a degradation ladder, not a mem0 replacement.
 - A failed non-read (e.g. `history`) with no cache and no local match returns the original API error.
 - Single-process assumption: concurrent pi instances share the JSON store via last-writer-wins debounced writes.
+- Sync uploads are plain `add`s — if a memory was *also* added to mem0 by another client during the outage, a duplicate may result.
 
 ## Development
 
