@@ -4,6 +4,13 @@
   "description": "Pi extension that caches mem0 reads and falls back to a local memory store when the mem0 API is unavailable or over quota",
   "license": "MIT",
   "type": "module",
+  "author": "ArtrixTech",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ArtrixTech/pi-mem0-cache.git"
+  },
+  "homepage": "https://github.com/ArtrixTech/pi-mem0-cache",
+  "bugs": "https://github.com/ArtrixTech/pi-mem0-cache/issues",
   "keywords": [
     "pi-package",
     "pi-extension",
@@ -23,7 +30,11 @@
   ],
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "prepublishOnly": "npm run typecheck && npm test"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*"

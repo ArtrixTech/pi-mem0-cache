@@ -34,12 +34,12 @@ Add to `~/.pi/agent/settings.json`:
 ```json
 {
   "packages": [
-    "git:https://github.com/ArtrixTech/pi-mem0-cache"
+    "npm:pi-mem0-cache"
   ]
 }
 ```
 
-Restart pi. No configuration needed — it works alongside `@mem0/pi-agent-plugin` (or any mem0 client using global `fetch`).
+or from the git source directly: `"git:https://github.com/ArtrixTech/pi-mem0-cache"`. Then restart pi — no configuration needed. It works alongside `@mem0/pi-agent-plugin` (or any mem0 client using global `fetch`).
 
 ## Usage
 
