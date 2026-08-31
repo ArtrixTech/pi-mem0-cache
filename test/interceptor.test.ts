@@ -440,3 +440,114 @@ describe("wildcard filter normalization (mem0ai/mem0#6168)", () => {
     expect(normalizeWildcardFilters(JSON.stringify({ filters: ["not-an-object"] }))).toBe(JSON.stringify({ filters: ["not-an-object"] }));
   });
 });
+
+describe("freshness gate", () => {
+  it("answers reads locally within the interval without touching the network", async () => {
+    const store = makeStore();
+    let calls = 0;
+    const fetchImpl = (async () => {
+      calls++;
+      return okJson({ results: [{ id: "1", memory: "user prefers vim keybindings" }] });
+    }) as typeof fetch;
+    const fetcher = createInterceptor(fetchImpl, { store, save: () => {}, ttlMs: 60_000, remoteReadIntervalMs: 3_600_000 });
+
+    await fetcher(...searchRequest("vim"));
+    expect(calls).toBe(1);
+    expect(store.netState.lastRemoteReadAt).toBeDefined();
+
+    const res = await fetcher(...searchRequest("another query mentioning vim"));
+    expect(calls).toBe(1);
+    expect(store.stats.gated).toBe(1);
+    const body = (await res.json()) as { results: { id: string }[] };
+    expect(body.results.map((r) => r.id)).toEqual(["1"]);
+  });
+
+  it("hits the network again once the interval has passed", async () => {
+    const store = makeStore();
+    let calls = 0;
+    const fetchImpl = (async () => {
+      calls++;
+      return okJson({ results: [] });
+    }) as typeof fetch;
+    const fetcher = createInterceptor(fetchImpl, { store, save: () => {}, ttlMs: 0, remoteReadIntervalMs: 3_600_000 });
+    await fetcher(...searchRequest("q"));
+    store.netState.lastRemoteReadAt = Date.now() - 3_600_001;
+    await fetcher(...searchRequest("q2"));
+    expect(calls).toBe(2);
+  });
+
+  it("does not gate history reads", async () => {
+    const store = makeStore();
+    let calls = 0;
+    const fetchImpl = (async () => {
+      calls++;
+      return okJson({ history: [] });
+    }) as typeof fetch;
+    const fetcher = createInterceptor(fetchImpl, { store, save: () => {}, ttlMs: 0, remoteReadIntervalMs: 3_600_000 });
+    store.netState.lastRemoteReadAt = Date.now();
+    await fetcher("https://api.mem0.ai/v1/memories/abc/history/", { method: "GET" });
+    expect(calls).toBe(1);
+  });
+
+  it("gate is off by default", async () => {
+    const store = makeStore();
+    let calls = 0;
+    const fetchImpl = (async () => {
+      calls++;
+      return okJson({ results: [] });
+    }) as typeof fetch;
+    const fetcher = createInterceptor(fetchImpl, { store, save: () => {}, ttlMs: 0 });
+    await fetcher(...searchRequest("q1"));
+    await fetcher(...searchRequest("q2"));
+    expect(calls).toBe(2);
+    expect(store.stats.gated).toBe(0);
+  });
+});
+
+describe("429 breaker", () => {
+  function quotaExceeded(): Response {
+    return new Response(JSON.stringify({ error: "Usage quota exceeded for this billing period.", event_type: "SEARCH" }), {
+      status: 429,
+      headers: { "content-type": "application/json", "retry-after": "3600" },
+    });
+  }
+
+  it("arms from retry-after, logs the response body, and gates later reads", async () => {
+    const store = makeStore();
+    let calls = 0;
+    const fetchImpl = (async () => {
+      calls++;
+      return quotaExceeded();
+    }) as typeof fetch;
+    const reasons: string[] = [];
+    const fetcher = createInterceptor(fetchImpl, { store, save: () => {}, ttlMs: 60_000, onFallback: (r) => reasons.push(r) });
+
+    const r1 = await fetcher(...searchRequest("q"));
+    expect(r1.status).toBe(200);
+    expect(store.netState.readsBlockedUntil).toBeGreaterThan(Date.now());
+    expect(reasons[0]).toContain("HTTP 429");
+    expect(reasons[0]).toContain("Usage quota exceeded");
+
+    await fetcher(...searchRequest("different q"));
+    expect(calls).toBe(1);
+    expect(store.stats.gated).toBe(1);
+  });
+
+  it("arms with a default block when retry-after is absent", async () => {
+    const store = makeStore();
+    const fetchImpl = (async () => okJson({ error: "too many" }, 429)) as typeof fetch;
+    const fetcher = createInterceptor(fetchImpl, { store, save: () => {}, ttlMs: 60_000 });
+    await fetcher(...searchRequest("q"));
+    expect(store.netState.readsBlockedUntil).toBeGreaterThan(Date.now());
+  });
+
+  it("a successful read clears the breaker", async () => {
+    const store = makeStore();
+    store.netState.readsBlockedUntil = Date.now() - 1000;
+    const fetchImpl = (async () => okJson({ results: [] })) as typeof fetch;
+    const fetcher = createInterceptor(fetchImpl, { store, save: () => {}, ttlMs: 60_000 });
+    await fetcher(...searchRequest("q"));
+    expect(store.netState.readsBlockedUntil).toBeUndefined();
+    expect(store.netState.lastRemoteReadAt).toBeDefined();
+  });
+});

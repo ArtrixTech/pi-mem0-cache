@@ -9,6 +9,8 @@ The extension wraps `globalThis.fetch` inside the pi process and transparently i
 **Reads** (`search`, `get_all`, `get`, `history`)
 
 - Successful responses are cached to disk with a **24h TTL**. Identical requests within the TTL never touch the network — this alone cuts most repeat-query quota burn, since agents re-run similar memory searches constantly.
+- A **freshness gate** caps remote reads at **one per hour** (`MEM0_CACHE_REMOTE_READ_INTERVAL_MS`, default 1h). Within the window, searches and listings are answered from the cache/local store. `/mem0-cache refresh` clears the gate explicitly.
+- A **429 breaker**: when mem0 answers `429 Usage quota exceeded`, the `retry-after` hint arms a breaker; while armed, reads skip the network entirely. The error body (which names the exhausted quota, e.g. `SEARCH`) is included in the fallback log line.
 - If the API fails (quota exhausted, 4xx/5xx, network down):
   1. A **stale cache entry** is served if one exists, otherwise
   2. A **local memory store** answers the query (keyword-overlap search over every memory ever observed plus all local writes).
@@ -50,6 +52,7 @@ or from the git source directly: `"git:https://github.com/ArtrixTech/pi-mem0-cac
 ```
 /mem0-cache stats       # cache size, pending local memories, counters, last sync result
 /mem0-cache sync        # force-upload pending local memories to mem0 now
+/mem0-cache refresh     # clear the freshness gate + 429 breaker; next read hits the API
 /mem0-cache clear       # wipe the read cache (keep local memories)
 /mem0-cache clear-all   # wipe everything
 /mem0-cache path        # show store location
@@ -59,17 +62,19 @@ or from the git source directly: `"git:https://github.com/ArtrixTech/pi-mem0-cac
 
 Everything lives in one JSON file: `~/.pi/agent/mem0-cache.json` (override with `MEM0_CACHE_PATH`). Human-readable; safe to inspect or hand-edit while pi is stopped.
 
-TTL defaults to 24h; override with `MEM0_CACHE_TTL_MS`.
+TTL defaults to 24h; override with `MEM0_CACHE_TTL_MS`. The freshness gate defaults to 1h; override with `MEM0_CACHE_REMOTE_READ_INTERVAL_MS`.
 
 ## Design notes
 
 - **Interception layer**: pi's `tool_call` hook can only block or mutate tool arguments — it cannot inject a synthetic successful result. The mem0 SDK resolves global `fetch` at call time, so wrapping `fetch` is the cleanest transparent seam: no patching `node_modules`, no local proxy process, survives plugin upgrades.
 - **TTL over write-invalidation**: mem0 search is semantic; results drift as memories are added. A 24h TTL is a simple, predictable freshness bound.
+- **Global freshness gate over per-query caching alone**: measured hit rate of exact-match query caching on real agent traffic was ~9% (queries rarely repeat verbatim); the 1h gate is what actually bounds retrieval-quota burn.
 - **Auto-sync on first success**: the trigger for uploading pending local memories is any successful mem0 response — the earliest possible proof that quota/connectivity is back. Replays use the original add payload so scoping is preserved. Sync calls go through the *unwrapped* fetch, never re-entering the interceptor.
 
 ## Limitations
 
 - Local fallback search is keyword overlap, not semantic. It's a degradation ladder, not a mem0 replacement.
+- The freshness gate and 429 breaker cover only locally-synthesizable reads (`search`, `get_all`, `get`); `history` and unknown reads stay on the network path.
 - A failed non-read (e.g. `history`) with no cache and no local match returns the original API error.
 - Single-process assumption: concurrent pi instances share the JSON store via last-writer-wins debounced writes.
 - Sync uploads are plain `add`s — if a memory was *also* added to mem0 by another client during the outage, a duplicate may result.

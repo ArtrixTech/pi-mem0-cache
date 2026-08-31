@@ -5,6 +5,10 @@
  * - Reads (search / getAll / get / history) are cached to disk with a 24h TTL.
  * - On API failure (quota exhausted, network down, 4xx/5xx), reads fall back
  *   to the stale cache entry, then to a local memory store.
+ * - A 429 response arms a breaker (duration from retry-after): while armed,
+ *   reads are answered locally without touching the API.
+ * - A freshness gate limits remote reads to one per remoteReadIntervalMs
+ *   (default 1h); /mem0-cache refresh resets it explicitly.
  * - Writes that fail against the API are applied to the local store instead.
  *
  * Local writes are NOT replayed to mem0 later — the local store remains
@@ -19,6 +23,8 @@ import { dirname, join } from "node:path";
 
 const DEFAULT_STORE_PATH = join(homedir(), ".pi", "agent", "mem0-cache.json");
 const DEFAULT_TTL_MS = 24 * 60 * 60 * 1000;
+const DEFAULT_REMOTE_READ_INTERVAL_MS = 60 * 60 * 1000;
+const DEFAULT_429_BLOCK_MS = 5 * 60 * 1000;
 const WRAPPED = Symbol.for("pi-mem0-cache.wrapped");
 const MAX_FALLBACK_RESULTS = 10;
 
@@ -48,11 +54,19 @@ export interface SyncState {
   lastResult?: string;
 }
 
+export interface NetState {
+  /** Reads skip the network until this time (armed by a 429's retry-after). */
+  readsBlockedUntil?: number;
+  /** Last successful remote read — the freshness gate's reference point. */
+  lastRemoteReadAt?: number;
+}
+
 export interface Store {
   version: 1;
   cache: Record<string, CachedResponse>;
   memories: Record<string, LocalMemory>;
   syncState: SyncState;
+  netState: NetState;
   stats: {
     hits: number;
     misses: number;
@@ -60,6 +74,7 @@ export interface Store {
     staleServed: number;
     fallbacks: number;
     localWrites: number;
+    gated: number;
   };
 }
 
@@ -69,7 +84,8 @@ export function emptyStore(): Store {
     cache: {},
     memories: {},
     syncState: {},
-    stats: { hits: 0, misses: 0, passthroughs: 0, staleServed: 0, fallbacks: 0, localWrites: 0 },
+    netState: {},
+    stats: { hits: 0, misses: 0, passthroughs: 0, staleServed: 0, fallbacks: 0, localWrites: 0, gated: 0 },
   };
 }
 
@@ -83,6 +99,7 @@ export function loadStore(path: string): Store {
       cache: parsed.cache ?? {},
       memories: parsed.memories ?? {},
       syncState: parsed.syncState ?? {},
+      netState: parsed.netState ?? {},
       stats: { ...base.stats, ...(parsed.stats ?? {}) },
     };
   } catch {
@@ -368,6 +385,10 @@ export interface InterceptorOptions {
   authRef?: { current?: CapturedAuth };
   /** Called after any successful mem0 API response (read or write). */
   onPassthroughSuccess?: () => void;
+  /** Freshness window: synthesizable reads (search / getAll / get) issued
+   *  within this interval since the last successful remote read are answered
+   *  locally without touching the network. 0 disables the gate. */
+  remoteReadIntervalMs?: number;
 }
 
 function jsonResponse(body: unknown, status = 200): Response {
@@ -381,7 +402,25 @@ export function createInterceptor(
   fetchImpl: typeof fetch,
   opts: InterceptorOptions,
 ): typeof fetch {
-  const { store, save, ttlMs, onFallback } = opts;
+  const { store, save, ttlMs, onFallback, remoteReadIntervalMs = 0 } = opts;
+
+  /** Answer a read without the network: stale cache first, then the local
+   *  store. Null for reads that can't be synthesized (history, unknown). */
+  const serveLocalRead = (req: ClassifiedRequest, cached?: CachedResponse): Response | null => {
+    if (cached) return jsonResponse(JSON.parse(cached.body), cached.status);
+    if (req.kind === "read-search") {
+      return jsonResponse({ results: searchLocal(store, req.query ?? "").map(stripInternal) });
+    }
+    if (req.kind === "read-getall") {
+      const all = Object.values(store.memories).filter((m) => !m.deleted).map(stripInternal);
+      return jsonResponse({ results: all, count: all.length });
+    }
+    if (req.kind === "read-get" && req.memoryId) {
+      const m = store.memories[req.memoryId];
+      if (m && !m.deleted) return jsonResponse(stripInternal(m));
+    }
+    return null;
+  };
 
   const interceptor = async (input: FetchInput, init?: RequestInit): Promise<Response> => {
     let req = classify(input, init);
@@ -416,7 +455,10 @@ export function createInterceptor(
         }
         store.stats.fallbacks++;
         store.stats.localWrites++;
-        onFallback?.(`write ${req.kind} fell back to local store (HTTP ${res.status})`);
+        const writeErrBody = await res.clone().text().catch(() => "");
+        onFallback?.(
+          `write ${req.kind} fell back to local store (HTTP ${res.status})${writeErrBody ? `: ${writeErrBody.slice(0, 200)}` : ""}`,
+        );
       } catch (err) {
         store.stats.fallbacks++;
         store.stats.localWrites++;
@@ -437,6 +479,23 @@ export function createInterceptor(
       return jsonResponse(JSON.parse(cached.body), cached.status);
     }
 
+    // -- Network gates -------------------------------------------------------
+    // 429 breaker (armed from retry-after) and the freshness window both answer
+    // reads locally without touching the API. Only reads we can synthesize are
+    // gated; history / unknown reads stay on the network path.
+    const gateable = req.kind === "read-search" || req.kind === "read-getall" || req.kind === "read-get";
+    const breakerArmed =
+      store.netState.readsBlockedUntil !== undefined && Date.now() < store.netState.readsBlockedUntil;
+    const freshnessActive =
+      remoteReadIntervalMs > 0 &&
+      store.netState.lastRemoteReadAt !== undefined &&
+      Date.now() - store.netState.lastRemoteReadAt < remoteReadIntervalMs;
+    if (gateable && (breakerArmed || freshnessActive)) {
+      store.stats.gated++;
+      save();
+      return serveLocalRead(req, cached) ?? jsonResponse({ error: "not available locally (network gate active)" }, 404);
+    }
+
     store.stats.misses++;
     let failed: Response | null = null;
     try {
@@ -445,6 +504,8 @@ export function createInterceptor(
         const body = await res.clone().text();
         store.cache[key] = { status: res.status, body, savedAt: Date.now() };
         harvestMemories(store, body);
+        store.netState.lastRemoteReadAt = Date.now();
+        delete store.netState.readsBlockedUntil;
         store.stats.passthroughs++;
         opts.onPassthroughSuccess?.();
         save();
@@ -452,7 +513,13 @@ export function createInterceptor(
       }
       failed = res;
       store.stats.fallbacks++;
-      onFallback?.(`read ${req.kind} fell back (HTTP ${res.status})`);
+      const errBody = await res.clone().text().catch(() => "");
+      if (res.status === 429) {
+        const retryAfterSec = Number(res.headers.get("retry-after"));
+        store.netState.readsBlockedUntil =
+          Date.now() + (Number.isFinite(retryAfterSec) && retryAfterSec > 0 ? retryAfterSec * 1000 : DEFAULT_429_BLOCK_MS);
+      }
+      onFallback?.(`read ${req.kind} fell back (HTTP ${res.status})${errBody ? `: ${errBody.slice(0, 200)}` : ""}`);
     } catch (err) {
       store.stats.fallbacks++;
       onFallback?.(`read ${req.kind} fell back (${err instanceof Error ? err.message : String(err)})`);
@@ -465,21 +532,10 @@ export function createInterceptor(
     }
 
     // Local fallback for search / getAll / single get.
-    if (req.kind === "read-search") {
+    const localAnswer = serveLocalRead(req);
+    if (localAnswer) {
       save();
-      return jsonResponse({ results: searchLocal(store, req.query ?? "").map(stripInternal) });
-    }
-    if (req.kind === "read-getall") {
-      const all = Object.values(store.memories).filter((m) => !m.deleted).map(stripInternal);
-      save();
-      return jsonResponse({ results: all, count: all.length });
-    }
-    if (req.kind === "read-get" && req.memoryId) {
-      const m = store.memories[req.memoryId];
-      if (m && !m.deleted) {
-        save();
-        return jsonResponse(stripInternal(m));
-      }
+      return localAnswer;
     }
 
     // Can't synthesize a meaningful answer (history, unknown reads): return the
@@ -595,6 +651,10 @@ export function createSyncRunner(opts: SyncRunnerOptions) {
 export default function piMem0Cache(pi: ExtensionAPI): void {
   const storePath = process.env.MEM0_CACHE_PATH ?? DEFAULT_STORE_PATH;
   const ttlMs = Number(process.env.MEM0_CACHE_TTL_MS) > 0 ? Number(process.env.MEM0_CACHE_TTL_MS) : DEFAULT_TTL_MS;
+  const remoteReadIntervalMs =
+    Number(process.env.MEM0_CACHE_REMOTE_READ_INTERVAL_MS) > 0
+      ? Number(process.env.MEM0_CACHE_REMOTE_READ_INTERVAL_MS)
+      : DEFAULT_REMOTE_READ_INTERVAL_MS;
   const store = loadStore(storePath);
   const save = makeSaver(store, storePath);
 
@@ -619,6 +679,7 @@ export default function piMem0Cache(pi: ExtensionAPI): void {
       store,
       save,
       ttlMs,
+      remoteReadIntervalMs,
       authRef,
       onFallback: (reason) => console.warn(`[pi-mem0-cache] ${reason}`),
       onPassthroughSuccess: () => {
@@ -630,7 +691,7 @@ export default function piMem0Cache(pi: ExtensionAPI): void {
   }
 
   pi.registerCommand("mem0-cache", {
-    description: "mem0 read cache: /mem0-cache [stats|sync|clear|clear-all|path]",
+    description: "mem0 read cache: /mem0-cache [stats|sync|refresh|clear|clear-all|path]",
     handler: async (args, ctx) => {
       const sub = (args ?? "").trim() || "stats";
       switch (sub) {
@@ -638,12 +699,27 @@ export default function piMem0Cache(pi: ExtensionAPI): void {
           const s = store.stats;
           const localCount = syncer.pendingCount();
           const sync = store.syncState.lastResult ? ` | last sync: ${store.syncState.lastResult}` : "";
+          const blocked = store.netState.readsBlockedUntil;
+          const gate =
+            blocked !== undefined && Date.now() < blocked
+              ? ` | reads blocked until ${new Date(blocked).toISOString()}`
+              : store.netState.lastRemoteReadAt !== undefined
+                ? ` | last remote read ${Math.round((Date.now() - store.netState.lastRemoteReadAt) / 60000)}min ago`
+                : "";
           ctx.ui.notify(
             `mem0-cache: ${Object.keys(store.cache).length} cached reads, ` +
               `${localCount} pending local memories | hits ${s.hits}, misses ${s.misses}, ` +
-              `passthroughs ${s.passthroughs}, stale ${s.staleServed}, fallbacks ${s.fallbacks}, localWrites ${s.localWrites}${sync}`,
+              `passthroughs ${s.passthroughs}, stale ${s.staleServed}, fallbacks ${s.fallbacks}, ` +
+              `localWrites ${s.localWrites}, gated ${s.gated}${sync}${gate}`,
             "info",
           );
+          break;
+        }
+        case "refresh": {
+          delete store.netState.lastRemoteReadAt;
+          delete store.netState.readsBlockedUntil;
+          save();
+          ctx.ui.notify("mem0-cache: gates cleared — the next read hits the mem0 API", "info");
           break;
         }
         case "sync": {
@@ -671,7 +747,7 @@ export default function piMem0Cache(pi: ExtensionAPI): void {
           ctx.ui.notify(`mem0-cache store: ${storePath}`, "info");
           break;
         default:
-          ctx.ui.notify("usage: /mem0-cache [stats|sync|clear|clear-all|path]", "warning");
+          ctx.ui.notify("usage: /mem0-cache [stats|sync|refresh|clear|clear-all|path]", "warning");
       }
     },
   });
