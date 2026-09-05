@@ -1135,6 +1135,33 @@ export interface PullAllResult {
   total: number;
 }
 
+/** Fallback auth built from the mem0 client's environment key (Token scheme,
+ *  default platform origin) — used when no request has been observed yet. */
+export function authFromEnv(): CapturedAuth | undefined {
+  const key = process.env.MEM0_API_KEY;
+  if (!key) return undefined;
+  return { origin: process.env.MEM0_API_ORIGIN || "https://api.mem0.ai", headers: { authorization: `Token ${key}` } };
+}
+
+/** Fallback filters parsed from any cached request key in the store — lets
+ *  pull-all run before the client has made a single read this session. */
+export function filtersFromCache(store: Store): Record<string, unknown> | undefined {
+  for (const key of Object.keys(store.cache)) {
+    if (!key.startsWith("POST /v3/memories/")) continue;
+    const bodyStart = key.indexOf(" ");
+    if (bodyStart < 0) continue;
+    try {
+      const parsed = JSON.parse(key.slice(bodyStart + 1)) as { filters?: Record<string, unknown> };
+      if (parsed.filters && typeof parsed.filters === "object" && Object.keys(parsed.filters).length > 0) {
+        return parsed.filters;
+      }
+    } catch {
+      /* skip malformed key */
+    }
+  }
+  return undefined;
+}
+
 export async function pullAllMemories(opts: PullAllOptions): Promise<PullAllResult> {
   const { store, fetchImpl, getAuth, getFilters, pageSize = 500, maxPages = 50 } = opts;
   const auth = getAuth();
@@ -1314,8 +1341,8 @@ export default function piMem0Cache(pi: ExtensionAPI): void {
                 if (!realFetch) throw new Error("fetch unavailable");
                 return realFetch(...args);
               },
-              getAuth: () => authRef.current,
-              getFilters: () => filtersRef.current,
+              getAuth: () => authRef.current ?? authFromEnv(),
+              getFilters: () => filtersRef.current ?? filtersFromCache(store),
             });
             save();
             ctx.ui.notify(

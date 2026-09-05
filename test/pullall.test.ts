@@ -1,12 +1,14 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 import {
+  authFromEnv,
   createEmbedHarness,
   createInterceptor,
   emptyStore,
   emptyVectorStore,
+  filtersFromCache,
   pullAllMemories,
   type CapturedAuth,
   type Embedder,
@@ -113,6 +115,30 @@ describe("ensureEmbeddings chunking", () => {
     await harness.ensure();
     expect(batchSizes).toEqual([256, 256, 88]);
     expect(Object.keys(vecStore.vectors)).toHaveLength(600);
+  });
+});
+
+describe("pull-all fallbacks", () => {
+  it("builds auth from the environment key with the Token scheme", () => {
+    vi.stubEnv("MEM0_API_KEY", "m0-env-key");
+    vi.stubEnv("MEM0_API_ORIGIN", "");
+    const a = authFromEnv();
+    expect(a?.origin).toBe("https://api.mem0.ai");
+    expect(a?.headers.authorization).toBe("Token m0-env-key");
+    vi.stubEnv("MEM0_API_KEY", "");
+    expect(authFromEnv()).toBeUndefined();
+    vi.unstubAllEnvs();
+  });
+
+  it("parses filters from cached request keys", () => {
+    const store = makeStore();
+    store.cache["POST /v3/memories/search/ {\"query\":\"q\",\"filters\":{\"user_id\":\"artrix\",\"app_id\":\"artrix-reach\"}}"] = {
+      status: 200,
+      body: "{\"results\":[]}",
+      savedAt: Date.now(),
+    };
+    expect(filtersFromCache(store)).toEqual({ user_id: "artrix", app_id: "artrix-reach" });
+    expect(filtersFromCache(emptyStore())).toBeUndefined();
   });
 });
 
