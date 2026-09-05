@@ -16,8 +16,11 @@
  *   the local mirror semantically for gated/fallback reads and is shadow-logged
  *   next to the keyword ranking.
  *
- * Local writes are NOT replayed to mem0 later — the local store remains
- * searchable via the read fallback.
+ * Successful remote writes echo into the mirror (delete/update/delete-all
+ * propagate; adds harvest from the response) and invalidate the read cache.
+ * Writes that fall back locally are queued: adds replay on sync from their
+ * original payload; update/delete/delete-all intents replay from an op log
+ * in the order they were applied.
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -60,6 +63,18 @@ export interface LocalMemory {
   [key: string]: unknown;
 }
 
+/** A write intent captured while the API was unavailable, replayed verbatim
+ *  on sync. Adds are not ops — they replay from LocalMemory.addPayload. */
+export interface PendingOp {
+  kind: "write-update" | "write-delete" | "write-delete-all";
+  memoryId?: string;
+  /** Original update body, replayed verbatim. */
+  bodyText?: string;
+  /** Original delete-all query string, so scope params survive the replay. */
+  query?: string;
+  at: number;
+}
+
 export interface SyncState {
   backoffUntil?: number;
   lastAttemptAt?: number;
@@ -77,6 +92,7 @@ export interface Store {
   version: 1;
   cache: Record<string, CachedResponse>;
   memories: Record<string, LocalMemory>;
+  ops: PendingOp[];
   syncState: SyncState;
   netState: NetState;
   stats: {
@@ -95,6 +111,7 @@ export function emptyStore(): Store {
     version: 1,
     cache: {},
     memories: {},
+    ops: [],
     syncState: {},
     netState: {},
     stats: { hits: 0, misses: 0, passthroughs: 0, staleServed: 0, fallbacks: 0, localWrites: 0, gated: 0 },
@@ -110,6 +127,7 @@ export function loadStore(path: string): Store {
       version: 1,
       cache: parsed.cache ?? {},
       memories: parsed.memories ?? {},
+      ops: parsed.ops ?? [],
       syncState: parsed.syncState ?? {},
       netState: parsed.netState ?? {},
       stats: { ...base.stats, ...(parsed.stats ?? {}) },
@@ -323,7 +341,12 @@ function applyLocalWrite(store: Store, req: ClassifiedRequest): Record<string, u
       if (existing) {
         if (text !== undefined) existing.memory = text;
         existing.updated_at = now;
-        existing.source = "local";
+        // source stays as-is: a mirrored (observed) memory updated offline is
+        // carried to the cloud by the queued op below, not by an add replay.
+        if (!id.startsWith("local-")) {
+          store.ops.push({ kind: "write-update", memoryId: id, bodyText: req.bodyText, at: Date.now() });
+        }
+        // local-* memories fold the edit into their pending add replay.
       } else {
         store.memories[id] = { id, memory: text ?? "", created_at: now, updated_at: now, source: "local" };
       }
@@ -332,14 +355,60 @@ function applyLocalWrite(store: Store, req: ClassifiedRequest): Record<string, u
     case "write-delete": {
       const id = req.memoryId ?? "";
       if (store.memories[id]) store.memories[id].deleted = true;
+      // Cloud ids queue a delete op even when never mirrored — the intent must
+      // reach the server. local-* ids purge at sync without ever uploading.
+      if (!id.startsWith("local-")) {
+        store.ops.push({ kind: "write-delete", memoryId: id, at: Date.now() });
+      }
       return { message: "Memory deleted locally (mem0 API unavailable)." };
     }
     case "write-delete-all": {
       for (const m of Object.values(store.memories)) m.deleted = true;
+      store.ops.push({ kind: "write-delete-all", query: req.url.search, at: Date.now() });
       return { message: "Memories deleted locally (mem0 API unavailable)." };
     }
     default:
       return { message: "Handled locally (mem0 API unavailable)." };
+  }
+}
+
+/** Propagate a confirmed-remote write into the mirror: delete/update/
+ *  delete-all leave no harvestable trace in the response body, so without
+ *  this echo the mirror would keep serving the mutated/deleted memories. */
+export function applyRemoteWriteEcho(store: Store, req: ClassifiedRequest): void {
+  const now = new Date().toISOString();
+  if (req.kind === "write-update" && req.memoryId) {
+    const id = req.memoryId;
+    let text: string | undefined;
+    try {
+      const body = JSON.parse(req.bodyText ?? "{}") as { text?: unknown };
+      if (typeof body.text === "string") text = body.text;
+    } catch {
+      /* ignore */
+    }
+    const existing = store.memories[id];
+    if (existing) {
+      if (text !== undefined) existing.memory = text;
+      existing.updated_at = now;
+    } else if (text !== undefined) {
+      store.memories[id] = { id, memory: text, created_at: now, updated_at: now, source: "observed" };
+    }
+  } else if (req.kind === "write-delete" && req.memoryId) {
+    const m = store.memories[req.memoryId];
+    if (m) m.deleted = true;
+  } else if (req.kind === "write-delete-all") {
+    for (const m of Object.values(store.memories)) m.deleted = true;
+  }
+}
+
+/** A confirmed-remote mutation carries newer state than any op queued offline
+ *  for the same target; queued ops for it would replay stale intents. */
+export function reconcileOps(store: Store, req: ClassifiedRequest): void {
+  if (req.kind === "write-delete-all") {
+    store.ops = [];
+  } else if ((req.kind === "write-update" || req.kind === "write-delete") && req.memoryId) {
+    const id = req.memoryId;
+    store.ops = store.ops.filter((o) => o.memoryId !== id);
   }
 }
 
@@ -934,8 +1003,13 @@ export function createInterceptor(
           // the mirror tracks newly written memories organically.
           const body = await res.clone().text().catch(() => "");
           if (body) harvestMemories(store, body);
+          applyRemoteWriteEcho(store, req);
+          reconcileOps(store, req);
+          // Every cached read predates this mutation.
+          store.cache = {};
           store.stats.passthroughs++;
           opts.onPassthroughSuccess?.();
+          save();
           return res;
         }
         store.stats.fallbacks++;
@@ -949,6 +1023,8 @@ export function createInterceptor(
         store.stats.localWrites++;
         onFallback?.(`write ${req.kind} fell back to local store (${err instanceof Error ? err.message : String(err)})`);
       }
+      // The mirror just changed — cached reads predate the mutation.
+      store.cache = {};
       const result = applyLocalWrite(store, req);
       save();
       return jsonResponse(result);
@@ -1055,7 +1131,9 @@ export interface SyncResult {
   uploaded: number;
   failed: number;
   skipped: boolean;
+  /** Pending work remaining: local adds + queued ops. */
   pending: number;
+  appliedOps: number;
 }
 
 const DEFAULT_SYNC_BACKOFF_MS = 60 * 60 * 1000;
@@ -1066,6 +1144,55 @@ export function createSyncRunner(opts: SyncRunnerOptions) {
   let inFlight: Promise<SyncResult> | null = null;
 
   const pendingList = () => Object.values(store.memories).filter((m) => m.source === "local" && !m.deleted);
+  const pendingTotal = () => pendingList().length + store.ops.length;
+
+  async function replayAdd(m: LocalMemory, auth: CapturedAuth): Promise<boolean> {
+    const payload = { ...(m.addPayload ?? {}), messages: [{ role: "user", content: m.memory }] };
+    try {
+      const res = await fetchImpl(`${auth.origin}/v3/memories/add/`, {
+        method: "POST",
+        headers: { ...auth.headers, "content-type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      if (!res.ok) return false;
+      harvestMemories(store, await res.text().catch(() => ""));
+      m.source = "observed";
+      delete m.addPayload;
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Replay one queued write intent. 404 counts as applied: the server-side
+   *  goal state (updated/gone) is unreachable because the target is gone —
+   *  the mirror converges by dropping its copy. */
+  async function replayOp(op: PendingOp, auth: CapturedAuth): Promise<boolean> {
+    const headers = { ...auth.headers, "content-type": "application/json" };
+    try {
+      if (op.kind === "write-update" && op.memoryId) {
+        const res = await fetchImpl(`${auth.origin}/v1/memories/${op.memoryId}/`, {
+          method: "PUT",
+          headers,
+          body: op.bodyText ?? "{}",
+        });
+        if (!res.ok && res.status !== 404) return false;
+        if (res.status === 404) delete store.memories[op.memoryId];
+      } else if (op.kind === "write-delete" && op.memoryId) {
+        const res = await fetchImpl(`${auth.origin}/v1/memories/${op.memoryId}/`, { method: "DELETE", headers });
+        if (!res.ok && res.status !== 404) return false;
+        delete store.memories[op.memoryId]; // server-gone: drop the tombstone
+      } else if (op.kind === "write-delete-all") {
+        const res = await fetchImpl(`${auth.origin}/v1/memories/${op.query ?? ""}`, { method: "DELETE", headers });
+        if (!res.ok && res.status !== 404) return false;
+        for (const m of Object.values(store.memories)) if (m.deleted) delete store.memories[m.id];
+      }
+      store.ops = store.ops.filter((o) => o !== op);
+      return true;
+    } catch {
+      return false;
+    }
+  }
 
   async function sync(force = false): Promise<SyncResult> {
     // Locally-created memories deleted before ever syncing never reached the
@@ -1076,64 +1203,58 @@ export function createSyncRunner(opts: SyncRunnerOptions) {
 
     const pending = pendingList();
     const auth = getAuth();
-    if (pending.length === 0 || !auth) {
-      return { uploaded: 0, failed: 0, skipped: true, pending: pending.length };
+    if ((pending.length === 0 && store.ops.length === 0) || !auth) {
+      return { uploaded: 0, failed: 0, skipped: true, pending: pendingTotal(), appliedOps: 0 };
     }
     const now = Date.now();
     if (!force && store.syncState.backoffUntil && now < store.syncState.backoffUntil) {
-      return { uploaded: 0, failed: 0, skipped: true, pending: pending.length };
+      return { uploaded: 0, failed: 0, skipped: true, pending: pendingTotal(), appliedOps: 0 };
     }
     store.syncState.lastAttemptAt = now;
 
+    // Replay in the order the writes happened locally: adds (created_at) and
+    // queued ops (at) merge into one chronological queue, so a delete-all
+    // recorded before a later add replays before it.
+    const queue: { at: number; kind: "add" | "op"; run: () => Promise<boolean> }[] = [
+      ...pending.map((m) => ({ at: Date.parse(m.created_at) || 0, kind: "add" as const, run: () => replayAdd(m, auth) })),
+      ...store.ops.map((op) => ({ at: op.at, kind: "op" as const, run: () => replayOp(op, auth) })),
+    ].sort((a, b) => a.at - b.at);
+
     let uploaded = 0;
+    let appliedOps = 0;
     let failed = 0;
-    for (const m of pending) {
-      const payload = { ...(m.addPayload ?? {}), messages: [{ role: "user", content: m.memory }] };
-      try {
-        const res = await fetchImpl(`${auth.origin}/v3/memories/add/`, {
-          method: "POST",
-          headers: { ...auth.headers, "content-type": "application/json" },
-          body: JSON.stringify(payload),
-        });
-        if (res.ok) {
-          uploaded++;
-          harvestMemories(store, await res.text().catch(() => ""));
-          m.source = "observed";
-          delete m.addPayload;
-        } else {
-          failed++;
-          store.syncState.backoffUntil = Date.now() + backoffMs;
-          onEvent?.(`sync paused after HTTP ${res.status}; retrying after backoff`);
-          break;
-        }
-      } catch (err) {
-        failed++;
-        store.syncState.backoffUntil = Date.now() + backoffMs;
-        onEvent?.(`sync paused after error: ${err instanceof Error ? err.message : String(err)}`);
-        break;
+    for (const item of queue) {
+      if (await item.run()) {
+        if (item.kind === "add") uploaded++;
+        else appliedOps++;
+        continue;
       }
+      failed++;
+      store.syncState.backoffUntil = Date.now() + backoffMs;
+      onEvent?.("sync paused after a failed replay; retrying after backoff");
+      break;
     }
-    store.syncState.lastResult = `uploaded ${uploaded}, failed ${failed}, pending ${pendingList().length}`;
+    store.syncState.lastResult = `uploaded ${uploaded}, ops applied ${appliedOps}, failed ${failed}, pending ${pendingTotal()}`;
     save();
-    if (uploaded > 0 || failed > 0) {
+    if (uploaded > 0 || appliedOps > 0 || failed > 0) {
       onEvent?.(`sync: ${store.syncState.lastResult}`);
     }
-    return { uploaded, failed, skipped: false, pending: pendingList().length };
+    return { uploaded, failed, skipped: false, pending: pendingTotal(), appliedOps };
   }
 
   /** Fire-and-forget; dedupes concurrent runs. Returns null when nothing to do. */
   function maybeSync(): Promise<SyncResult> | null {
     if (inFlight) return inFlight;
-    if (pendingList().length === 0) return null;
+    if (pendingList().length === 0 && store.ops.length === 0) return null;
     inFlight = sync(false)
-      .catch(() => ({ uploaded: 0, failed: 0, skipped: true, pending: pendingList().length }))
+      .catch(() => ({ uploaded: 0, failed: 0, skipped: true, pending: pendingTotal(), appliedOps: 0 }))
       .finally(() => {
         inFlight = null;
       });
     return inFlight;
   }
 
-  return { sync, maybeSync, pendingCount: () => pendingList().length };
+  return { sync, maybeSync, pendingCount: () => pendingList().length, pendingOps: () => store.ops.length };
 }
 
 // ---------------------------------------------------------------------------
@@ -1293,6 +1414,7 @@ export default function piMem0Cache(pi: ExtensionAPI): void {
         case "stats": {
           const s = store.stats;
           const localCount = syncer.pendingCount();
+          const opCount = syncer.pendingOps();
           const sync = store.syncState.lastResult ? ` | last sync: ${store.syncState.lastResult}` : "";
           const blocked = store.netState.readsBlockedUntil;
           const gate =
@@ -1303,7 +1425,7 @@ export default function piMem0Cache(pi: ExtensionAPI): void {
                 : "";
           ctx.ui.notify(
             `mem0-cache: ${Object.keys(store.cache).length} cached reads, ` +
-              `${localCount} pending local memories | hits ${s.hits}, misses ${s.misses}, ` +
+              `${localCount} pending local memories${opCount > 0 ? `, ${opCount} pending ops` : ""} | hits ${s.hits}, misses ${s.misses}, ` +
               `passthroughs ${s.passthroughs}, stale ${s.staleServed}, fallbacks ${s.fallbacks}, ` +
               `localWrites ${s.localWrites}, gated ${s.gated}${sync}${gate}`,
             "info",

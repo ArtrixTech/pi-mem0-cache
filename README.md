@@ -17,13 +17,14 @@ The extension wraps `globalThis.fetch` inside the pi process and transparently i
 
 **Writes** (`add`, `update`, `delete`, `delete_all`)
 
-- Tried against the real API first. On success, behavior is unchanged.
+- Tried against the real API first. On success the write **echoes into the mirror** (adds harvest from the response; update/delete/delete-all propagate directly) and the read cache is invalidated, so gated/fallback reads never serve pre-write state.
 - On failure, the mutation is applied to the **local store** (with the original request payload, scope params included) and a synthetic success response is returned, so no memory is lost while mem0 is unavailable.
 
 **Auto-sync**
 
-- The moment *any* mem0 API call succeeds again (quota refilled, network back), all pending local memories are uploaded in the background via `/v3/memories/add/` — replayed with their **original scope payload** (`user_id`, `app_id`, …), so they land in the right scope.
-- Uploaded memories are marked `observed`; local copies that were deleted before ever syncing are purged.
+- The moment *any* mem0 API call succeeds again (quota refilled, network back), pending writes replay in the background **in the order they happened**: offline `add`s upload via `/v3/memories/add/` with their **original scope payload** (`user_id`, `app_id`, …); offline `update`/`delete`/`delete_all` intents replay verbatim from an op log (PUT/DELETE to the original target, delete-all keeps its original query string).
+- A confirmed-remote write supersedes queued ops for the same target; replay 404s count as applied and the mirror converges to server state (server-gone entries are dropped).
+- Uploaded memories are marked `observed`; local copies that were deleted before ever syncing are purged, as are tombstones whose delete op has replayed.
 - Auth headers are captured transparently from the mem0 client's own requests — no configuration needed.
 - On failure mid-sync, the runner backs off for 1h before retrying. Force an immediate attempt with `/mem0-cache sync`.
 
@@ -85,7 +86,7 @@ TTL defaults to 24h; override with `MEM0_CACHE_TTL_MS`. The freshness gate defau
 ## Design notes
 
 - **Interception layer**: pi's `tool_call` hook can only block or mutate tool arguments — it cannot inject a synthetic successful result. The mem0 SDK resolves global `fetch` at call time, so wrapping `fetch` is the cleanest transparent seam: no patching `node_modules`, no local proxy process, survives plugin upgrades.
-- **TTL over write-invalidation**: mem0 search is semantic; results drift as memories are added. A 24h TTL is a simple, predictable freshness bound.
+- **Write-through consistency**: any write — remote-confirmed or locally applied — invalidates the read cache and echoes into the mirror, so the 24h TTL never serves pre-write state.
 - **Global freshness gate over per-query caching alone**: measured hit rate of exact-match query caching on real agent traffic was ~9% (queries rarely repeat verbatim); the 1h gate is what actually bounds retrieval-quota burn.
 - **Auto-sync on first success**: the trigger for uploading pending local memories is any successful mem0 response — the earliest possible proof that quota/connectivity is back. Replays use the original add payload so scoping is preserved. Sync calls go through the *unwrapped* fetch, never re-entering the interceptor.
 

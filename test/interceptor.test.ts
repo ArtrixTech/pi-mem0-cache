@@ -208,7 +208,9 @@ describe("interceptor writes", () => {
     const res = await fetcher("https://api.mem0.ai/v1/memories/u/", { method: "PUT", body: JSON.stringify({ text: "new text" }) });
     expect(res.status).toBe(200);
     expect(store.memories.u.memory).toBe("new text");
-    expect(store.memories.u.source).toBe("local");
+    // stays "observed" — the edit replays via the queued op, not an add
+    expect(store.memories.u.source).toBe("observed");
+    expect(store.ops).toMatchObject([{ kind: "write-update", memoryId: "u" }]);
   });
 
   it("failed delete marks memory deleted", async () => {
