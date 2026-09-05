@@ -1163,7 +1163,10 @@ export async function pullAllMemories(opts: PullAllOptions): Promise<PullAllResu
     fetched += results.length;
     if (typeof body.count === "number") total = body.count;
     if (results.length > 0) harvestMemories(store, JSON.stringify({ results }));
+    // Stop when the page runs short OR the server-reported total is reached —
+    // the server may clamp page_size below what we asked for.
     if (results.length < pageSize) break;
+    if (total > 0 && fetched >= total) break;
   }
   return { pages, fetched, newHarvested: Object.keys(store.memories).length - before, total };
 }

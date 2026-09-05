@@ -7,7 +7,7 @@
 - **Changes**: `/mem0-cache pull-all` — paginated getAll (`POST /v3/memories/?page=N&page_size=M`) with the client's captured auth (`Token` scheme) and read filters (app_id/agent_id/run_id stripped → all apps of the user), run through the unwrapped fetch (bypasses gates/cache), every page harvested into the mirror; follows with incremental embed; `ensureEmbeddings` now chunks embed requests at 256 inputs/call (full-corpus rebuilds stay under timeout); interceptor captures latest read filters into a shared filtersRef; v0.7.0.
 - **Reason**: user found cloud holds 4,069 memories while the local mirror had 124 — the mirror is a query-driven partial cache (only search-result harvests + local writes), so 97% of the corpus was invisible to gated reads; pull-all makes it a full replica (one-time ~270K tokens embed ≈ 2.7% of the Jina grant).
 - **Process**: read mem0ai platform client source for the contract (`?page&page_size` query params, caller-driven pagination, `Authorization: Token` scheme, `{results, count}` response); 66/66 tests incl. pagination stop-on-short-page, Token-scheme header, filter stripping, idempotent re-harvest, 256-chunk split ([256,256,88]), filters capture.
-- **Result**: typecheck clean, 66/66 tests (5 new); committed `<pending-hash>`.
+- **Result**: typecheck clean, 66/66 tests (5 new); committed `fa37ca1` (feat + release bump 0.7.0).
 - **Notes**: pull-all requires ≥1 mem0 read in the session first (auth/filters capture); re-runs are idempotent (harvest dedupes by id); vector sidecar grows to ~23MB at 4K memories — acceptable, lazy-load is a later optimization; run from a fresh pi session to avoid stale-store clobber from pre-upgrade sessions.
 
 ## feat(embed): jina-backed vector recall for gated reads and shadow
