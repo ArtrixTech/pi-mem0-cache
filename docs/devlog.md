@@ -1,5 +1,25 @@
 # devlog
 
+## feat(embed): jina-backed vector recall for gated reads and shadow
+
+`<pending>` | 2026-09-05
+
+- **Changes**: embedding recall layer — when `JINA_API_KEY` is set, corpus memories are embedded incrementally (sha1-hash-tracked, one batch call, sidecar `~/.pi/agent/mem0-vectors.json`, model-tagged with wipe-on-mismatch) and gated/fallback search reads are ranked by cosine similarity via `api.jina.ai/v1/embeddings` (default `jina-embeddings-v5-text-nano`); provider failure → 1-minute cooldown + keyword-ranking degradation (answers never break); shadow entries gain optional vector side (`localVec`, `overlapVec5/10`, `mrrVec`) so keyword and vector recall are both measured against remote; `/mem0-cache embed` status + `/mem0-cache embed refresh` force re-embed; v0.6.0.
+- **Reason**: user decision — start Jina vector recall now (step toward similarity-threshold reuse); free tier 100 RPM/100K TPM is orders of magnitude above need; OpenAI-compatible endpoint keeps the provider seam ready for a local Ollama backend later.
+- **Process**: verified `jina-embeddings-v5-text-nano` id + dims (768) from jina.ai/models; 2 test-fix rounds — cosine of [1,0.05] vs [0,1] is ≈0.05, orthogonality needs query [1,0]; incremental-embed mock records texts, ids assertion replaced. Entry-level tests cover the full wiring (seeded gate + jina mock → vector-ordered gated read, embed status, refresh, and keyword-only degradation without key).
+- **Result**: typecheck clean, 61/61 tests (13 new across embed unit + entry); committed `<pending-hash>`.
+- **Notes**: vectors normalize client-side before cosine (safe regardless of server normalization); harness never throws and answers null on cooldown; shadow vec side records rounded 4-dp cosine scores; gated reads trigger ensure() lazily so corpus embeds on first gated search after any mirror change.
+
+## feat(shadow): log local-vs-remote search agreement on every miss
+
+`<pending>` | 2026-09-05
+
+- **Changes**: shadow logger on the read-search miss path — one JSONL entry per miss to `~/.pi/agent/mem0-shadow.jsonl` (local keyword-overlap ranking vs remote mem0 ranking, overlap@5/@10, MRR of the remote top-1, mode `remote`/`fallback`); comparison runs before harvest so the local side is the true pre-fetch mirror state; `/mem0-cache shadow` aggregate command; `MEM0_CACHE_SHADOW=0` disables, `MEM0_CACHE_SHADOW_PATH` overrides sidecar; rotation to 2000 lines past 4MB; `searchLocal` refactored into `searchLocalScored` (scores exposed, ranking unchanged); v0.5.0.
+- **Reason**: step 2 of the quota plan — quantify whether local recall is good enough to serve freshness-gated reads permanently (prerequisite for similarity-threshold reuse); pure logging, zero behavior change by design.
+- **Process**: 2 test iterations — CJK tokenization counts 备/份 as separate tokens (score 3→4); rotation moved to append-then-compact so the file stays ≤ keepLines (check-before-append left a keepLines+1 tail). Entry-level smoke test pins the default-export wiring and `/mem0-cache shadow` output.
+- **Result**: typecheck clean, 48/48 tests (16 new across shadow unit + interceptor + entry); committed 73eecd6 (feat + release bump 0.5.0).
+- **Notes**: gated reads are intentionally not logged (no remote ground truth exists for them); fallback-mode entries carry empty `remote` arrays; malformed JSONL lines are skipped on read.
+
 ## fix: normalize "*" entity filters — workaround for mem0ai/mem0#6168
 
 `<pending>` | 2026-08-30
