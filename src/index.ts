@@ -10,6 +10,8 @@
  * - A freshness gate limits remote reads to one per remoteReadIntervalMs
  *   (default 1h); /mem0-cache refresh resets it explicitly.
  * - Writes that fail against the API are applied to the local store instead.
+ * - A shadow logger records local-vs-remote search agreement for every search
+ *   miss (~/.pi/agent/mem0-shadow.jsonl). Purely observational.
  *
  * Local writes are NOT replayed to mem0 later — the local store remains
  * searchable via the read fallback.
@@ -17,7 +19,7 @@
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -25,6 +27,9 @@ const DEFAULT_STORE_PATH = join(homedir(), ".pi", "agent", "mem0-cache.json");
 const DEFAULT_TTL_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_REMOTE_READ_INTERVAL_MS = 60 * 60 * 1000;
 const DEFAULT_429_BLOCK_MS = 5 * 60 * 1000;
+const DEFAULT_SHADOW_PATH = join(homedir(), ".pi", "agent", "mem0-shadow.jsonl");
+const SHADOW_ROTATE_BYTES = 4 * 1024 * 1024;
+const SHADOW_KEEP_LINES = 2000;
 const WRAPPED = Symbol.for("pi-mem0-cache.wrapped");
 const MAX_FALLBACK_RESULTS = 10;
 
@@ -248,10 +253,14 @@ export function tokenize(text: string): string[] {
   return text.toLowerCase().match(/[a-z0-9_]+|[一-鿿＀-￯]/g) ?? [];
 }
 
-export function searchLocal(store: Store, query: string, limit = MAX_FALLBACK_RESULTS): LocalMemory[] {
+export function searchLocalScored(
+  store: Store,
+  query: string,
+  limit = MAX_FALLBACK_RESULTS,
+): { m: LocalMemory; score: number }[] {
   const tokens = tokenize(query);
   const all = Object.values(store.memories).filter((m) => !m.deleted);
-  if (tokens.length === 0) return all.slice(0, limit);
+  if (tokens.length === 0) return all.slice(0, limit).map((m) => ({ m, score: 0 }));
   const scored = all
     .map((m) => {
       const text = m.memory.toLowerCase();
@@ -261,7 +270,11 @@ export function searchLocal(store: Store, query: string, limit = MAX_FALLBACK_RE
     })
     .filter((s) => s.score > 0)
     .sort((a, b) => b.score - a.score);
-  return scored.slice(0, limit).map((s) => s.m);
+  return scored.slice(0, limit);
+}
+
+export function searchLocal(store: Store, query: string, limit = MAX_FALLBACK_RESULTS): LocalMemory[] {
+  return searchLocalScored(store, query, limit).map((s) => s.m);
 }
 
 function stripInternal(m: LocalMemory): Record<string, unknown> {
@@ -321,6 +334,153 @@ function applyLocalWrite(store: Store, req: ClassifiedRequest): Record<string, u
     default:
       return { message: "Handled locally (mem0 API unavailable)." };
   }
+}
+
+// ---------------------------------------------------------------------------
+// Shadow log: records local-vs-remote search agreement on every miss
+
+export interface ShadowLocalHit {
+  id: string;
+  score: number;
+}
+
+export interface ShadowRemoteHit {
+  id: string;
+  score?: number;
+}
+
+export interface ShadowEntry {
+  ts: number;
+  /** remote = miss answered by the API; fallback = API failed, local answered */
+  mode: "remote" | "fallback";
+  query: string;
+  local: ShadowLocalHit[];
+  remote: ShadowRemoteHit[];
+  overlap5: number;
+  overlap10: number;
+  /** reciprocal rank of the remote top-1 id within the local ranking (0 = absent) */
+  mrr: number;
+}
+
+export function compareShadow(
+  local: { id: string }[],
+  remote: { id: string }[],
+): { overlap5: number; overlap10: number; mrr: number } {
+  const localTop10 = local.slice(0, 10);
+  const remoteTop10 = remote.slice(0, 10);
+  const overlap = (k: number): number => {
+    const remoteTopK = remoteTop10.slice(0, k).map((h) => h.id);
+    const localTopK = new Set(localTop10.slice(0, k).map((h) => h.id));
+    return remoteTopK.filter((id) => localTopK.has(id)).length;
+  };
+  const remoteTop1 = remoteTop10[0]?.id;
+  const rank = remoteTop1 === undefined ? -1 : localTop10.findIndex((h) => h.id === remoteTop1);
+  return { overlap5: overlap(5), overlap10: overlap(10), mrr: rank >= 0 ? 1 / (rank + 1) : 0 };
+}
+
+export interface ShadowSummary {
+  comparisons: number;
+  fallbacks: number;
+  meanOverlap5: number;
+  meanOverlap10: number;
+  meanMrr: number;
+  perfect5Rate: number;
+  top1Recall: number;
+}
+
+export function summarizeShadow(entries: ShadowEntry[]): ShadowSummary {
+  const remote = entries.filter((e) => e.mode === "remote");
+  const n = remote.length;
+  const mean = (pick: (e: ShadowEntry) => number) => (n === 0 ? 0 : remote.reduce((sum, e) => sum + pick(e), 0) / n);
+  return {
+    comparisons: n,
+    fallbacks: entries.length - n,
+    meanOverlap5: mean((e) => e.overlap5),
+    meanOverlap10: mean((e) => e.overlap10),
+    meanMrr: mean((e) => e.mrr),
+    perfect5Rate: n === 0 ? 0 : remote.filter((e) => e.overlap5 >= 5).length / n,
+    top1Recall: n === 0 ? 0 : remote.filter((e) => e.mrr > 0).length / n,
+  };
+}
+
+/** Append one entry, then compact the file once it exceeds rotateBytes,
+ *  keeping the most recent keepLines lines. */
+export function appendShadowLog(
+  path: string,
+  entry: ShadowEntry,
+  rotateBytes = SHADOW_ROTATE_BYTES,
+  keepLines = SHADOW_KEEP_LINES,
+): void {
+  try {
+    appendFileSync(path, `${JSON.stringify(entry)}\n`);
+    if (statSync(path).size > rotateBytes) {
+      const lines = readFileSync(path, "utf8").split("\n").filter(Boolean);
+      writeFileSync(path, `${lines.slice(-keepLines).join("\n")}\n`);
+    }
+  } catch (err) {
+    console.warn("[pi-mem0-cache] failed to append shadow log:", err);
+  }
+}
+
+export function readShadowEntries(path: string): ShadowEntry[] {
+  try {
+    if (!existsSync(path)) return [];
+    const entries: ShadowEntry[] = [];
+    for (const line of readFileSync(path, "utf8").split("\n")) {
+      if (!line.trim()) continue;
+      try {
+        entries.push(JSON.parse(line) as ShadowEntry);
+      } catch {
+        /* skip malformed line */
+      }
+    }
+    return entries;
+  } catch {
+    return [];
+  }
+}
+
+function remoteSearchHits(body: string | null): ShadowRemoteHit[] {
+  if (!body) return [];
+  try {
+    const parsed = JSON.parse(body) as { results?: unknown };
+    const results = Array.isArray(parsed.results) ? parsed.results : [];
+    const hits: ShadowRemoteHit[] = [];
+    for (const item of results.slice(0, 10)) {
+      if (typeof item === "object" && item !== null && typeof (item as { id?: unknown }).id === "string") {
+        const hit = item as { id: string; score?: unknown };
+        hits.push(typeof hit.score === "number" ? { id: hit.id, score: hit.score } : { id: hit.id });
+      }
+    }
+    return hits;
+  } catch {
+    return [];
+  }
+}
+
+/** Compare the pre-fetch mirror state against the remote answer for one search.
+ *  Called BEFORE harvestMemories on the success path, so the local ranking
+ *  reflects what a freshness-gated read would have served from the mirror. */
+function recordShadow(
+  log: (entry: ShadowEntry) => void,
+  mode: ShadowEntry["mode"],
+  req: ClassifiedRequest,
+  remoteBody: string | null,
+  store: Store,
+): void {
+  const remote = remoteSearchHits(remoteBody);
+  const local = searchLocalScored(store, req.query ?? "", 10).map(({ m, score }) => ({ id: m.id, score }));
+  const { overlap5, overlap10, mrr } = compareShadow(local, remote);
+  log({
+    ts: Date.now(),
+    mode,
+    query: (req.query ?? "").slice(0, 200),
+    local,
+    remote,
+    overlap5,
+    overlap10,
+    mrr,
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -389,6 +549,8 @@ export interface InterceptorOptions {
    *  within this interval since the last successful remote read are answered
    *  locally without touching the network. 0 disables the gate. */
   remoteReadIntervalMs?: number;
+  /** Receives one ShadowEntry per read-search miss (remote or fallback-served). */
+  shadowLog?: (entry: ShadowEntry) => void;
 }
 
 function jsonResponse(body: unknown, status = 200): Response {
@@ -502,6 +664,9 @@ export function createInterceptor(
       const res = await fetchImpl(input as string | URL | Request, init);
       if (res.ok) {
         const body = await res.clone().text();
+        if (req.kind === "read-search" && opts.shadowLog) {
+          recordShadow(opts.shadowLog, "remote", req, body, store);
+        }
         store.cache[key] = { status: res.status, body, savedAt: Date.now() };
         harvestMemories(store, body);
         store.netState.lastRemoteReadAt = Date.now();
@@ -534,6 +699,9 @@ export function createInterceptor(
     // Local fallback for search / getAll / single get.
     const localAnswer = serveLocalRead(req);
     if (localAnswer) {
+      if (req.kind === "read-search" && opts.shadowLog) {
+        recordShadow(opts.shadowLog, "fallback", req, null, store);
+      }
       save();
       return localAnswer;
     }
@@ -657,6 +825,8 @@ export default function piMem0Cache(pi: ExtensionAPI): void {
       : DEFAULT_REMOTE_READ_INTERVAL_MS;
   const store = loadStore(storePath);
   const save = makeSaver(store, storePath);
+  const shadowEnabled = process.env.MEM0_CACHE_SHADOW !== "0";
+  const shadowPath = process.env.MEM0_CACHE_SHADOW_PATH ?? DEFAULT_SHADOW_PATH;
 
   const g = globalThis as { fetch?: typeof fetch & { [WRAPPED]?: boolean } };
   const authRef: { current?: CapturedAuth } = {};
@@ -681,6 +851,7 @@ export default function piMem0Cache(pi: ExtensionAPI): void {
       ttlMs,
       remoteReadIntervalMs,
       authRef,
+      shadowLog: shadowEnabled ? (entry) => appendShadowLog(shadowPath, entry) : undefined,
       onFallback: (reason) => console.warn(`[pi-mem0-cache] ${reason}`),
       onPassthroughSuccess: () => {
         void syncer.maybeSync();
@@ -691,7 +862,7 @@ export default function piMem0Cache(pi: ExtensionAPI): void {
   }
 
   pi.registerCommand("mem0-cache", {
-    description: "mem0 read cache: /mem0-cache [stats|sync|refresh|clear|clear-all|path]",
+    description: "mem0 read cache: /mem0-cache [stats|sync|refresh|clear|clear-all|path|shadow]",
     handler: async (args, ctx) => {
       const sub = (args ?? "").trim() || "stats";
       switch (sub) {
@@ -732,6 +903,16 @@ export default function piMem0Cache(pi: ExtensionAPI): void {
           );
           break;
         }
+        case "shadow": {
+          const s = summarizeShadow(readShadowEntries(shadowPath));
+          ctx.ui.notify(
+            `mem0-cache shadow: ${s.comparisons} comparisons (${s.fallbacks} fallback) | ` +
+              `overlap@5 ${s.meanOverlap5.toFixed(2)}/5, overlap@10 ${s.meanOverlap10.toFixed(2)}/10 | ` +
+              `remote top-1 in local top-10: ${(s.top1Recall * 100).toFixed(0)}% | MRR ${s.meanMrr.toFixed(2)}`,
+            "info",
+          );
+          break;
+        }
         case "clear":
           store.cache = {};
           save();
@@ -747,7 +928,7 @@ export default function piMem0Cache(pi: ExtensionAPI): void {
           ctx.ui.notify(`mem0-cache store: ${storePath}`, "info");
           break;
         default:
-          ctx.ui.notify("usage: /mem0-cache [stats|sync|refresh|clear|clear-all|path]", "warning");
+          ctx.ui.notify("usage: /mem0-cache [stats|sync|refresh|clear|clear-all|path|shadow]", "warning");
       }
     },
   });

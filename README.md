@@ -29,6 +29,10 @@ The extension wraps `globalThis.fetch` inside the pi process and transparently i
 
 All memories seen in any API response are harvested into the local corpus, so the fallback search gets richer the longer you use it.
 
+**Shadow logger**
+
+Every `search` that misses the cache also records a comparison entry to `~/.pi/agent/mem0-shadow.jsonl` (override with `MEM0_CACHE_SHADOW_PATH`; disable with `MEM0_CACHE_SHADOW=0`): the keyword-overlap ranking the freshness gate would have served locally, next to the remote mem0 ranking, with `overlap@5`/`overlap@10`, the reciprocal rank of the remote top-1 in the local list (MRR), and a `mode` (`remote` = answered by the API, `fallback` = API failed and the mirror answered). On the success path the comparison runs *before* the response is harvested into the mirror, so the local ranking reflects the true pre-fetch corpus state. The logger changes nothing about answers — it builds the dataset for deciding whether local search is good enough to serve gated reads permanently. `/mem0-cache shadow` prints the aggregate agreement stats.
+
 **Upstream bug workaround** ([mem0ai/mem0#6168](https://github.com/mem0ai/mem0/issues/6168))
 
 The pi mem0 plugin's `global` scope is asymmetric: writes store `app_id: null`, reads filter `app_id: "*"`, and mem0's `*` wildcard matches only non-null values — so global memories are permanently unreachable. This extension normalizes read requests before they hit the API: entity filters (`user_id`/`agent_id`/`app_id`/`run_id`) whose value is `"*"` are dropped, restoring the intended "unconstrained" semantics. Normalization happens before cache-key computation, so wildcard and non-wildcard variants of the same read share one cache entry.
@@ -56,13 +60,14 @@ or from the git source directly: `"git:https://github.com/ArtrixTech/pi-mem0-cac
 /mem0-cache clear       # wipe the read cache (keep local memories)
 /mem0-cache clear-all   # wipe everything
 /mem0-cache path        # show store location
+/mem0-cache shadow      # local-vs-remote search agreement stats from the shadow log
 ```
 
 ## Storage
 
 Everything lives in one JSON file: `~/.pi/agent/mem0-cache.json` (override with `MEM0_CACHE_PATH`). Human-readable; safe to inspect or hand-edit while pi is stopped.
 
-TTL defaults to 24h; override with `MEM0_CACHE_TTL_MS`. The freshness gate defaults to 1h; override with `MEM0_CACHE_REMOTE_READ_INTERVAL_MS`.
+TTL defaults to 24h; override with `MEM0_CACHE_TTL_MS`. The freshness gate defaults to 1h; override with `MEM0_CACHE_REMOTE_READ_INTERVAL_MS`. The shadow log is a separate JSONL sidecar at `~/.pi/agent/mem0-shadow.jsonl`; it rotates to the most recent 2000 lines once it exceeds 4MB.
 
 ## Design notes
 
