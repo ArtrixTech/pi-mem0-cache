@@ -10,6 +10,16 @@
 - **Result**: 87/87 tests pass, typecheck clean.
 - **Notes**: multi-process store contention and scope-blind local getAll synthesis remain known minor gaps.
 
+## fix(embed): keep vector sidecar in lockstep with the mirror
+
+`5db37cb` | 2026-09-05
+
+- **Changes**: vector auto-sync — add responses are harvested on write success (v3 add returns the created memory, same as sync replays); `ensure()` fires at session start (warm the sidecar) and after every passthrough success; `/mem0-cache embed` self-heals sidecar drift before reporting; `ensure()` dedupes concurrent runs (in-flight guard); v0.7.2.
+- **Reason**: user report — embed showed ~124 vectors in fresh sessions and only reached 315 after a manual pull-all; the mirror grows via turn-end auto-capture adds, and nothing triggered re-embedding between searches.
+- **Process**: node repro isolated the failure to a test-wiring gap (the passthrough→ensure hook is entry responsibility), which exposed the real gap — direct adds were never harvested; entry-level test now covers the full chain (add → harvest → auto-embed → status 3/3).
+- **Result**: typecheck clean, 72/72 tests.
+- **Notes**: ensure() in-flight guard prevents duplicate concurrent embeds; /mem0-cache embed is now self-healing by design (drift visible for at most one display cycle). Entry recovered from the installed copy's uncommitted devlog.
+
 ## fix(embed): jinaApiKey from mem0-config.json + first-run pull-all fallbacks
 
 `ed64bcf` | 2026-09-05
