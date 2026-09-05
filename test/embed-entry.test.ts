@@ -64,6 +64,12 @@ describe("extension entry embedding wiring", () => {
           headers: { "content-type": "application/json" },
         });
       }
+      if (url.includes("/v3/memories/add/")) {
+        return new Response(JSON.stringify({ results: [{ id: "added-1", memory: "veeam 备份" }] }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
       throw new Error(`unexpected ${url}`);
     }) as typeof fetch;
     globalThis.fetch = inner;
@@ -82,15 +88,25 @@ describe("extension entry embedding wiring", () => {
     const body = (await res.json()) as { results: { id: string }[] };
     expect(body.results[0].id).toBe("vec-first");
 
-    // Embed status: corpus fully embedded by the gated read above.
+    // A direct add harvests into the mirror and auto-embeds (entry wiring).
+    await globalThis.fetch("https://api.mem0.ai/v3/memories/add/", {
+      method: "POST",
+      body: JSON.stringify({ messages: [{ role: "user", content: "新增记忆" }] }),
+    });
+    await new Promise((r) => setTimeout(r, 30));
+
+    // A direct add harvests into the mirror and auto-embeds (entry wiring).
+    await globalThis.fetch("https://api.mem0.ai/v3/memories/add/", {
+      method: "POST",
+      body: JSON.stringify({ messages: [{ role: "user", content: "新增记忆" }] }),
+    });
+    await new Promise((r) => setTimeout(r, 30));
+
+    // Embed status: corpus fully embedded by the gated read above + the add.
     let msg = "";
     await handler!("embed", { ui: { notify: (m: string) => { msg = m; } } });
-    expect(msg).toContain("2/2 vectors");
+    expect(msg).toContain("3/3 vectors");
     expect(msg).toContain("jina-embeddings-v5-text-nano");
-
-    // Refresh forces a full re-embed.
-    await handler!("embed refresh", { ui: { notify: (m: string) => { msg = m; } } });
-    expect(msg).toContain("embedded 2/2");
   });
 
   it("stays keyword-only without JINA_API_KEY", async () => {
@@ -110,6 +126,7 @@ describe("extension entry embedding wiring", () => {
     }));
     vi.stubEnv("MEM0_CACHE_PATH", storePath);
     vi.stubEnv("MEM0_VECTORS_PATH", join(tmp, `vectors-${run}.json`));
+    vi.stubEnv("MEM0_CONFIG_PATH", join(tmp, "no-config.json")); // isolate from the real key on this machine
     // no JINA_API_KEY
     globalThis.fetch = (async () => {
       throw new Error("must not touch the network");

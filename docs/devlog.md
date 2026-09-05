@@ -1,5 +1,14 @@
 # devlog
 
+## fix(embed): jinaApiKey from mem0-config.json + first-run pull-all fallbacks
+
+`<pending>` | 2026-09-05
+
+- **Changes**: pull-all now falls back to Token-scheme auth from `MEM0_API_KEY` and to filters parsed from cached request keys (key format `METHOD <path> <body-json>`, body may contain spaces) when nothing has been captured from live traffic; `createDefaultEmbedder` falls back to a `jinaApiKey` field in `mem0-config.json` when `JINA_API_KEY` is absent/empty (empty-string env values treated as absent — `??` regression caught by test); v0.7.1.
+- **Reason**: user hit two real-world first-run failures — pull-all as the first command after a restart had no captured auth ("run any mem0 read first"), and the embedding layer showed "disabled" because the restarted pi process never sourced the zshrc line containing JINA_API_KEY.
+- **Result**: 71/71 tests; commits `7bdea13`/`8a3616c`/`ed64bcf`; jinaApiKey written to mem0-config.json (local disk, same exposure as the mem0 key already there).
+- **Notes**: pipeline `npm test | tail` masked the failing-test exit code once — committed red, fixed in the next commit; use `npm test && git commit` chaining in future.
+
 ## feat(pull-all): full-mirror harvest via paginated getAll
 
 `<pending>` | 2026-09-05

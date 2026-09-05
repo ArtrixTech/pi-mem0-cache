@@ -216,6 +216,29 @@ describe("interceptor with embed harness", () => {
     expect(entries[0].mrrVec).toBe(0); // remote top-1 remote-1 is absent from the vector list
   });
 
+  it("re-embeds automatically after every successful passthrough (add)", async () => {
+    const store = emptyStore();
+    const vecStore = emptyVectorStore();
+    const embed = createEmbedHarness(store, () => {}, vecStore, {
+      model: "t",
+      embed: async (texts) => texts.map(() => [1, 0]),
+    });
+    const interceptor = createInterceptor(async (input) => {
+      const url = String(input);
+      if (url.includes("/v3/memories/add/")) {
+        return okJson({ results: [{ id: "new-1", memory: "新记忆 内容" }] });
+      }
+      throw new Error(`unexpected ${url}`);
+    }, { store, save: () => {}, ttlMs: 0, remoteReadIntervalMs: 0, embed, onPassthroughSuccess: () => void embed.ensure() });
+
+    await interceptor("https://api.mem0.ai/v3/memories/add/", {
+      method: "POST",
+      body: JSON.stringify({ messages: [{ role: "user", content: "x" }] }),
+    });
+    await new Promise((r) => setTimeout(r, 20)); // let the void'd ensure settle
+    expect(vecStore.vectors["new-1"]).toBeDefined(); // ensure fired on passthrough success
+  });
+
   it("degrades to keyword-only shadow fields when the harness fails", async () => {
     const store = storeWith(mem("a", "veeam 备份"));
     const vecStore = emptyVectorStore();

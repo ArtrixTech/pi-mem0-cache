@@ -706,15 +706,22 @@ export function createEmbedHarness(
     lastError = err instanceof Error ? err.message : String(err);
     cooldownUntil = Date.now() + EMBED_COOLDOWN_MS;
   };
-  const ensure = async (): Promise<void> => {
-    if (Date.now() < cooldownUntil) return;
-    try {
-      const r = await ensureEmbeddings(store, vecStore, embedder);
-      if (r.embedded > 0) saveVectors();
-      lastError = undefined;
-    } catch (err) {
-      fail(err);
-    }
+  let ensurePromise: Promise<void> | null = null;
+  const ensure = (): Promise<void> => {
+    if (ensurePromise) return ensurePromise;
+    ensurePromise = (async () => {
+      if (Date.now() < cooldownUntil) return;
+      try {
+        const r = await ensureEmbeddings(store, vecStore, embedder);
+        if (r.embedded > 0) saveVectors();
+        lastError = undefined;
+      } catch (err) {
+        fail(err);
+      }
+    })().finally(() => {
+      ensurePromise = null;
+    });
+    return ensurePromise;
   };
   const search = async (query: string): Promise<{ m: LocalMemory; score: number }[] | null> => {
     if (Date.now() < cooldownUntil) return null;
@@ -923,6 +930,10 @@ export function createInterceptor(
       try {
         const res = await fetchImpl(input as string | URL | Request, init);
         if (res.ok) {
+          // Harvest the write response (v3 add returns the created memory) so
+          // the mirror tracks newly written memories organically.
+          const body = await res.clone().text().catch(() => "");
+          if (body) harvestMemories(store, body);
           store.stats.passthroughs++;
           opts.onPassthroughSuccess?.();
           return res;
@@ -1263,11 +1274,16 @@ export default function piMem0Cache(pi: ExtensionAPI): void {
       onFallback: (reason) => console.warn(`[pi-mem0-cache] ${reason}`),
       onPassthroughSuccess: () => {
         void syncer.maybeSync();
+        void embed?.ensure();
       },
     }) as typeof fetch & { [WRAPPED]?: boolean };
     wrapped[WRAPPED] = true;
     g.fetch = wrapped;
   }
+
+  // Warm the vector sidecar at session start: covers mirror drift accumulated
+  // before any search traffic has flowed through the interceptor.
+  void embed?.ensure();
 
   pi.registerCommand("mem0-cache", {
     description: "mem0 read cache: /mem0-cache [stats|sync|refresh|clear|clear-all|path|shadow|embed|pull-all]",
@@ -1327,9 +1343,13 @@ export default function piMem0Cache(pi: ExtensionAPI): void {
         }
         case "embed": {
           if (!embed) {
-            ctx.ui.notify("mem0-cache embed: disabled — set JINA_API_KEY to enable (MEM0_EMBED=0 forces off)", "warning");
+            ctx.ui.notify(
+              "mem0-cache embed: disabled — set JINA_API_KEY or mem0-config.json jinaApiKey (MEM0_EMBED=0 forces off)",
+              "warning",
+            );
             break;
           }
+          await embed.ensure(); // self-heal sidecar drift before reporting
           const s = embed.status();
           ctx.ui.notify(
             `mem0-cache embed: ${s.vectors}/${s.corpus} vectors | model ${s.model}` +
@@ -1341,7 +1361,7 @@ export default function piMem0Cache(pi: ExtensionAPI): void {
         }
         case "embed refresh": {
           if (!embed) {
-            ctx.ui.notify("mem0-cache embed: disabled — set JINA_API_KEY to enable", "warning");
+            ctx.ui.notify("mem0-cache embed: disabled — set JINA_API_KEY or mem0-config.json jinaApiKey", "warning");
             break;
           }
           const msg = await embed.refresh();
