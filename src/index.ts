@@ -667,7 +667,13 @@ export async function ensureEmbeddings(
     if (!m || m.deleted) delete vecStore.vectors[id];
   }
   if (targets.length === 0) return { embedded: 0, corpus: live.length };
-  const vecs = await embedder.embed(targets.map((m) => m.memory));
+  // Chunked embedding: thousands of inputs in one request would blow the
+  // per-request timeout; 256 inputs per call stays fast and well under limits.
+  const vecs: number[][] = [];
+  const CHUNK = 256;
+  for (let i = 0; i < targets.length; i += CHUNK) {
+    vecs.push(...(await embedder.embed(targets.slice(i, i + CHUNK).map((m) => m.memory))));
+  }
   targets.forEach((m, i) => {
     vecStore.vectors[m.id] = { hash: textHash(m.memory), vec: vecs[i] };
   });
@@ -829,6 +835,9 @@ export interface InterceptorOptions {
   /** Embedding harness: semantic ranking of the mirror for gated/fallback
    *  reads; null results degrade to the keyword ranking. */
   embed?: EmbedHarness;
+  /** Shared cell capturing the client's most recent read filters (user_id, …) —
+   *  pull-all reuses them minus entity-scoping keys. */
+  filtersRef?: { current?: Record<string, unknown> };
 }
 
 function jsonResponse(body: unknown, status = 200): Response {
@@ -882,6 +891,16 @@ export function createInterceptor(
       if (normalized !== undefined && normalized !== req.bodyText) {
         req = { ...req, bodyText: normalized };
         init = { ...init, body: normalized };
+      }
+      if (opts.filtersRef && req.bodyText) {
+        try {
+          const parsed = JSON.parse(req.bodyText) as { filters?: Record<string, unknown> };
+          if (typeof parsed.filters === "object" && parsed.filters !== null && Object.keys(parsed.filters).length > 0) {
+            opts.filtersRef.current = parsed.filters;
+          }
+        } catch {
+          /* ignore */
+        }
       }
     }
 
@@ -1094,6 +1113,62 @@ export function createSyncRunner(opts: SyncRunnerOptions) {
 }
 
 // ---------------------------------------------------------------------------
+// Pull-all: full-mirror harvest via paginated getAll (bypasses the interceptor)
+
+export interface PullAllOptions {
+  store: Store;
+  /** Unwrapped fetch — pull-all must bypass the interceptor's gates/cache. */
+  fetchImpl: typeof fetch;
+  getAuth: () => CapturedAuth | undefined;
+  /** Entity filters observed from the client's own reads; app_id/agent_id/run_id
+   *  are dropped so the mirror covers every app of the user. */
+  getFilters: () => Record<string, unknown> | undefined;
+  pageSize?: number;
+  maxPages?: number;
+}
+
+export interface PullAllResult {
+  pages: number;
+  fetched: number;
+  newHarvested: number;
+  /** Server-reported total for the filter scope (0 when absent). */
+  total: number;
+}
+
+export async function pullAllMemories(opts: PullAllOptions): Promise<PullAllResult> {
+  const { store, fetchImpl, getAuth, getFilters, pageSize = 500, maxPages = 50 } = opts;
+  const auth = getAuth();
+  if (!auth) throw new Error("no mem0 auth captured yet — run any mem0 read first");
+  const filters = getFilters();
+  if (!filters || Object.keys(filters).length === 0) {
+    throw new Error("no mem0 filters captured yet — run any memory search first");
+  }
+  const baseFilters: Record<string, unknown> = { ...filters };
+  for (const key of ["app_id", "agent_id", "run_id"]) delete baseFilters[key];
+  const before = Object.keys(store.memories).length;
+  let fetched = 0;
+  let pages = 0;
+  let total = 0;
+  for (let page = 1; page <= maxPages; page++) {
+    const url = `${auth.origin}/v3/memories/?page=${page}&page_size=${pageSize}`;
+    const res = await fetchImpl(url, {
+      method: "POST",
+      headers: { ...auth.headers, "content-type": "application/json" },
+      body: JSON.stringify({ filters: baseFilters }),
+    });
+    if (!res.ok) throw new Error(`getAll page ${page} HTTP ${res.status}`);
+    const body = (await res.json()) as { results?: unknown[]; count?: number };
+    const results = Array.isArray(body.results) ? body.results : [];
+    pages++;
+    fetched += results.length;
+    if (typeof body.count === "number") total = body.count;
+    if (results.length > 0) harvestMemories(store, JSON.stringify({ results }));
+    if (results.length < pageSize) break;
+  }
+  return { pages, fetched, newHarvested: Object.keys(store.memories).length - before, total };
+}
+
+// ---------------------------------------------------------------------------
 // Extension entry
 
 export default function piMem0Cache(pi: ExtensionAPI): void {
@@ -1115,6 +1190,7 @@ export default function piMem0Cache(pi: ExtensionAPI): void {
 
   const g = globalThis as { fetch?: typeof fetch & { [WRAPPED]?: boolean } };
   const authRef: { current?: CapturedAuth } = {};
+  const filtersRef: { current?: Record<string, unknown> } = {};
   // Capture the original fetch BEFORE wrapping so the sync runner's replayed
   // adds go straight to the network instead of re-entering the interceptor.
   const realFetch = g.fetch;
@@ -1138,6 +1214,7 @@ export default function piMem0Cache(pi: ExtensionAPI): void {
       authRef,
       shadowLog: shadowEnabled ? (entry) => appendShadowLog(shadowPath, entry) : undefined,
       embed,
+      filtersRef,
       onFallback: (reason) => console.warn(`[pi-mem0-cache] ${reason}`),
       onPassthroughSuccess: () => {
         void syncer.maybeSync();
@@ -1148,7 +1225,7 @@ export default function piMem0Cache(pi: ExtensionAPI): void {
   }
 
   pi.registerCommand("mem0-cache", {
-    description: "mem0 read cache: /mem0-cache [stats|sync|refresh|clear|clear-all|path|shadow|embed]",
+    description: "mem0 read cache: /mem0-cache [stats|sync|refresh|clear|clear-all|path|shadow|embed|pull-all]",
     handler: async (args, ctx) => {
       const sub = (args ?? "").trim() || "stats";
       switch (sub) {
@@ -1226,6 +1303,36 @@ export default function piMem0Cache(pi: ExtensionAPI): void {
           ctx.ui.notify(`mem0-cache embed refresh: ${msg}`, "info");
           break;
         }
+        case "pull-all": {
+          try {
+            const r = await pullAllMemories({
+              store,
+              fetchImpl: (...args) => {
+                if (!realFetch) throw new Error("fetch unavailable");
+                return realFetch(...args);
+              },
+              getAuth: () => authRef.current,
+              getFilters: () => filtersRef.current,
+            });
+            save();
+            ctx.ui.notify(
+              `mem0-cache pull-all: ${r.pages} pages, ${r.fetched} fetched, ${r.newHarvested} new ` +
+                `(mirror ${Object.keys(store.memories).length}${r.total ? `/${r.total}` : ""})`,
+              "info",
+            );
+            if (embed) {
+              await embed.ensure();
+              const s = embed.status();
+              ctx.ui.notify(`mem0-cache pull-all: vectors ${s.vectors}/${s.corpus}`, "info");
+            }
+          } catch (err) {
+            ctx.ui.notify(
+              `mem0-cache pull-all failed: ${err instanceof Error ? err.message : String(err)}`,
+              "warning",
+            );
+          }
+          break;
+        }
         case "clear":
           store.cache = {};
           save();
@@ -1241,7 +1348,7 @@ export default function piMem0Cache(pi: ExtensionAPI): void {
           ctx.ui.notify(`mem0-cache store: ${storePath}`, "info");
           break;
         default:
-          ctx.ui.notify("usage: /mem0-cache [stats|sync|refresh|clear|clear-all|path|shadow|embed]", "warning");
+          ctx.ui.notify("usage: /mem0-cache [stats|sync|refresh|clear|clear-all|path|shadow|embed|pull-all]", "warning");
       }
     },
   });

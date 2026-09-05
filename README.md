@@ -35,6 +35,10 @@ When `JINA_API_KEY` is set, corpus memories are embedded incrementally (hash-tra
 
 Shadow entries carry an optional vector side (`localVec`, `overlapVec5/10`, `mrrVec`) next to the keyword ranking, so both recall strategies are measured against the remote answer in `/mem0-cache shadow`.
 
+**Full mirror (`pull-all`)**
+
+The mirror is a query-driven partial cache by default — it only ever sees memories that flow back in API responses. `/mem0-cache pull-all` closes the gap: it fetches **every** memory for the user via paginated getAll (`POST /v3/memories/?page=N&page_size=M`, auth headers and entity filters captured transparently from the client's own reads), bypassing the interceptor's gates and cache with the unwrapped fetch, and harvests all pages into the local corpus. App-scoping filters (`app_id`/`agent_id`/`run_id`) are stripped, so the mirror covers every app of the user. Afterwards the new entries are embedded incrementally (256-input chunks, ~9K tokens per 1K memories). Requires at least one mem0 read in the session first (to capture auth); re-running is idempotent.
+
 **Shadow logger**
 
 Every `search` that misses the cache also records a comparison entry to `~/.pi/agent/mem0-shadow.jsonl` (override with `MEM0_CACHE_SHADOW_PATH`; disable with `MEM0_CACHE_SHADOW=0`): the keyword-overlap ranking the freshness gate would have served locally, next to the remote mem0 ranking, with `overlap@5`/`overlap@10`, the reciprocal rank of the remote top-1 in the local list (MRR), and a `mode` (`remote` = answered by the API, `fallback` = API failed and the mirror answered). On the success path the comparison runs *before* the response is harvested into the mirror, so the local ranking reflects the true pre-fetch corpus state. The logger changes nothing about answers — it builds the dataset for deciding whether local search is good enough to serve gated reads permanently. `/mem0-cache shadow` prints the aggregate agreement stats.
@@ -69,6 +73,7 @@ or from the git source directly: `"git:https://github.com/ArtrixTech/pi-mem0-cac
 /mem0-cache shadow      # local-vs-remote search agreement stats from the shadow log
 /mem0-cache embed       # embedding layer status (vectors/corpus, model, last error)
 /mem0-cache embed refresh # force a full re-embed of the corpus
+/mem0-cache pull-all    # fetch every cloud memory into the local mirror + incremental embed
 ```
 
 ## Storage
