@@ -34,6 +34,7 @@ const DEFAULT_SHADOW_PATH = join(homedir(), ".pi", "agent", "mem0-shadow.jsonl")
 const SHADOW_ROTATE_BYTES = 4 * 1024 * 1024;
 const SHADOW_KEEP_LINES = 2000;
 const DEFAULT_VECTORS_PATH = join(homedir(), ".pi", "agent", "mem0-vectors.json");
+const DEFAULT_MEM0_CONFIG_PATH = join(homedir(), ".pi", "agent", "mem0-config.json");
 const DEFAULT_EMBED_MODEL = "jina-embeddings-v5-text-nano";
 const EMBED_COOLDOWN_MS = 60 * 1000;
 const WRAPPED = Symbol.for("pi-mem0-cache.wrapped");
@@ -753,15 +754,27 @@ export function createEmbedHarness(
   return { ensure, search, status, refresh };
 }
 
-/** Default provider selection from the environment: Jina when JINA_API_KEY is
- *  present; MEM0_EMBED=0 forces off regardless. */
+/** Default provider selection: JINA_API_KEY env first, then `jinaApiKey` in
+ *  mem0-config.json (same file that already holds the mem0 key) — so the
+ *  embedding layer survives terminal environments that don't source ~/.zshrc.
+ *  MEM0_EMBED=0 forces off regardless. */
 export function createDefaultEmbedder(): Embedder | undefined {
   if (process.env.MEM0_EMBED === "0") return undefined;
-  const apiKey = process.env.JINA_API_KEY;
+  const apiKey = process.env.JINA_API_KEY || readJinaKeyFromConfig(process.env.MEM0_CONFIG_PATH);
   if (!apiKey) return undefined;
   return createJinaEmbedder(apiKey, process.env.MEM0_EMBED_MODEL ?? DEFAULT_EMBED_MODEL, (...args) =>
     globalThis.fetch(...args),
   );
+}
+
+export function readJinaKeyFromConfig(path = DEFAULT_MEM0_CONFIG_PATH): string | undefined {
+  try {
+    if (!existsSync(path)) return undefined;
+    const parsed = JSON.parse(readFileSync(path, "utf8")) as { jinaApiKey?: unknown };
+    return typeof parsed.jinaApiKey === "string" && parsed.jinaApiKey ? parsed.jinaApiKey : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 // ---------------------------------------------------------------------------
