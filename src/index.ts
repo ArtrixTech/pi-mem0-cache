@@ -1148,10 +1148,12 @@ export function authFromEnv(): CapturedAuth | undefined {
 export function filtersFromCache(store: Store): Record<string, unknown> | undefined {
   for (const key of Object.keys(store.cache)) {
     if (!key.startsWith("POST /v3/memories/")) continue;
-    const bodyStart = key.indexOf(" ");
-    if (bodyStart < 0) continue;
+    // Key format: "METHOD <path> <body-json>" — the JSON body may contain
+    // spaces (raw query text), so rejoin everything after the path.
+    const parts = key.split(" ");
+    if (parts.length < 3) continue;
     try {
-      const parsed = JSON.parse(key.slice(bodyStart + 1)) as { filters?: Record<string, unknown> };
+      const parsed = JSON.parse(parts.slice(2).join(" ")) as { filters?: Record<string, unknown> };
       if (parsed.filters && typeof parsed.filters === "object" && Object.keys(parsed.filters).length > 0) {
         return parsed.filters;
       }
