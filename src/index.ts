@@ -208,8 +208,8 @@ interface ClassifiedRequest {
   memoryId?: string;
   query?: string;
   /** Query string of the original request. The SDK's single-item GETs scope
-   *  through `?user_id=…` rather than a body, and a GET cannot carry a body
-   *  under fetch, so this is the only scope carrier those reads have. */
+   *  through `?user_id=…`. A GET carries no body under fetch, so the query
+   *  string is the sole scope carrier for those reads. */
   search?: string;
 }
 
@@ -404,7 +404,7 @@ function materialize(store: Store, ids: string[], limit: number): LocalMemory[] 
  * to. A tombstoned memory is dropped at the same point.
  *
  * Strategy resolution happens per call so a test-mode switch takes effect on the
- * next read rather than at session start. Every strategy is answerable: "dense"
+ * next read. Every strategy is answerable: "dense"
  * degrades to "bm25" when the embed harness returns nothing, and
  * "fusion+rerank" degrades to "fusion" without a reranker, so no configuration
  * can leave local reads unanswerable.
@@ -840,7 +840,7 @@ async function recordShadow(
   };
 
   // BM25 ranking — the new lexical floor, logged on the same entry so the
-  // legacy-vs-BM25 comparison comes from live traffic rather than a replay.
+  // legacy-vs-BM25 comparison comes from live traffic.
   const lexicalChannel = new LexicalChannel({ docs: scopedDocs() });
   const bm25Hits = lexicalChannel.search(query, 10) as ChannelHit[];
   const bm25Ids = bm25Hits.map((h) => h.id);
@@ -982,7 +982,7 @@ export function createJinaEmbedder(
  * local Ollama, …). The wire shape is identical across all of them: POST
  * {model, input: string[]} -> {data: [{embedding, index}]}. Provider choice is
  * therefore configuration, not code — which is what makes the provider swap and
- * the test-mode A/B a config change rather than a refactor.
+ * the test-mode A/B a config change alone.
  */
 export interface OpenAiCompatEmbedderOptions {
   apiKey: string;
@@ -1843,7 +1843,7 @@ export default function piMem0Cache(pi: ExtensionAPI): void {
   const authRef: { current?: CapturedAuth } = {};
   const filtersRef: { current?: Record<string, unknown> } = {};
   // Capture the original fetch BEFORE wrapping so the sync runner's replayed
-  // adds go straight to the network instead of re-entering the interceptor.
+  // adds go straight to the network, bypassing the interceptor.
   const realFetch = g.fetch;
   const syncer = createSyncRunner({
     store,
@@ -1973,7 +1973,7 @@ export default function piMem0Cache(pi: ExtensionAPI): void {
             .join("\n");
           let msg = `mem0-cache shadow: ${s.comparisons} comparisons (${s.fallbacks} fallback)\n${table}`;
           // Per-channel failures are the thing that silently degrades output, so
-          // they get their own line rather than being averaged away.
+          // each strategy gets its own line, keeping them separately readable.
           const errs = new Map<string, number>();
           for (const e of entries) {
             for (const [k, v] of Object.entries(e.channelErrors ?? {})) {

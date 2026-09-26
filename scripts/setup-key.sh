@@ -108,7 +108,7 @@ store_key() {
     echo "warning: that looks short for an OpenRouter key (expecting sk-or-v1-…)" >&2
   fi
 
-  # Overwrite any existing entry rather than failing.
+  # Overwrite any existing entry.
   security delete-generic-password -s "$service" >/dev/null 2>&1 || true
   printf '%s' "$key" | security add-generic-password -a "$USER" -s "$service" -w - >/dev/null
   unset key

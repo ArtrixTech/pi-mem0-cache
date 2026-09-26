@@ -37,7 +37,7 @@ describe("readKeyFromKeychain", () => {
     expect(readKeyFromKeychain("pi-mem0-cache.absent")).toBeUndefined();
   });
 
-  it("returns undefined for an empty secret rather than an empty string", () => {
+  it("returns undefined for an empty secret", () => {
     execFileSync.mockReturnValue("\n");
     expect(readKeyFromKeychain("pi-mem0-cache.empty")).toBeUndefined();
   });

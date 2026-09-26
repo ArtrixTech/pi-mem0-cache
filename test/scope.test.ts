@@ -21,7 +21,7 @@ describe("extractScope", () => {
     expect(extractScope(JSON.stringify({ query: "x" }))).toBeUndefined();
   });
 
-  it("returns undefined for a non-JSON body rather than throwing", () => {
+  it("returns undefined for a non-JSON body", () => {
     expect(extractScope("not json")).toBeUndefined();
     expect(extractScope(undefined)).toBeUndefined();
   });

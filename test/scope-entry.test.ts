@@ -15,7 +15,7 @@ interface NotifyCtx {
 
 /** Mount the extension against a seeded store and return the fetch the agent
  *  actually sees. The interceptor wraps globalThis.fetch at registration, so the
- *  test must read the wrapper after mounting rather than installing its own. */
+ *  test reads the wrapper after mounting. */
 function mount(run: string, memories: Record<string, unknown>) {
   const storePath = join(tmp, `store-${run}.json`);
   const realFetch = (async () => {

@@ -69,7 +69,7 @@ describe("cosine", () => {
     expect(cosine([1, 2], [10, 20])).toBeCloseTo(1, 10);
   });
 
-  it("returns 0 for a zero vector instead of NaN", () => {
+  it("returns 0 for a zero vector", () => {
     expect(cosine([0, 0], [1, 1])).toBe(0);
   });
 });
@@ -145,7 +145,7 @@ describe("recall", () => {
     expect(errors).toEqual(["dense"]);
   });
 
-  it("returns empty rather than throwing when every channel fails", async () => {
+  it("returns empty when every channel fails", async () => {
     const broken: RecallChannel = {
       name: "x",
       search: () => {

@@ -40,7 +40,7 @@ describe("searchBm25", () => {
     expect(hits[0].id).toBe("hkexpress");
   });
 
-  it("discriminates on CJK rather than matching any single character", () => {
+  it("discriminates on CJK content", () => {
     const idx = buildBm25Index(docs);
     const hits = searchBm25(idx, "备份作业");
     expect(hits[0].id).toBe("veeam");

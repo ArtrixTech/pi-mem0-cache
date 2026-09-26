@@ -30,8 +30,9 @@ export interface ChannelHit {
   score: number;
 }
 
-/** One named ranking channel. `available()` gates it for fusion so a configured
- *  but failing provider is excluded rather than silently contributing nothing. */
+/** One named ranking channel. `available()` gates a channel for fusion, and a
+ *  configured-but-failing provider gets reported in the recall status so its
+ *  absence stays visible. */
 export interface RecallChannel {
   name: string;
   search(query: string, limit: number): Promise<ChannelHit[]> | ChannelHit[];
@@ -181,9 +182,9 @@ export interface FuseResult {
  * Run every available channel, fuse the survivors, then optionally rerank.
  *
  * A channel that throws is reported in `status` and excluded from the fusion;
- * the call still returns whatever the remaining channels produced. With no
- * channels succeeding the result is empty rather than an exception, so the
- * caller can always fall back further.
+ * the call still returns whatever the remaining channels produced. When no
+ * channel succeeds the result is an empty list, so the caller can always fall
+ * back further.
  */
 export async function recall(opts: FuseOptions & { query: string }): Promise<FuseResult> {
   const perChannelLimit = opts.perChannelLimit ?? 50;
