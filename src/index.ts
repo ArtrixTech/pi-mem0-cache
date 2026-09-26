@@ -24,6 +24,7 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -1150,7 +1151,7 @@ export function createDefaultEmbedder(): Embedder | undefined {
   for (const name of order) {
     const preset = EMBED_PROVIDERS[name];
     if (!preset) continue;
-    const apiKey = process.env[preset.keyEnv];
+    const apiKey = resolveProviderKey(name);
     if (!apiKey) continue;
     return createOpenAiCompatEmbedder({
       apiKey,
@@ -1720,6 +1721,47 @@ export async function pullAllMemories(opts: PullAllOptions): Promise<PullAllResu
 // ---------------------------------------------------------------------------
 // Extension entry
 
+/** Keychain service name per provider, written by scripts/setup-key.sh. */
+export const KEYCHAIN_SERVICES: Record<string, string> = {
+  openrouter: "pi-mem0-cache.openrouter",
+  jina: "pi-mem0-cache.jina",
+  mem0: "pi-mem0-cache.mem0",
+};
+
+/**
+ * Read a secret from the macOS Keychain.
+ *
+ * Keys stored this way never appear in a shell export, a dotfile, a process
+ * argument, or a repo — `security -w` prints the value on stdout, so it is read
+ * as a buffer and never echoed. Returns undefined when the entry is missing or
+ * the platform has no keychain, so every caller keeps an env fallback.
+ */
+export function readKeyFromKeychain(service: string): string | undefined {
+  try {
+    const out = execFileSync("security", ["find-generic-password", "-s", service, "-w"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 5_000,
+    });
+    const trimmed = String(out).trim();
+    return trimmed.length > 0 ? trimmed : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Resolve a provider's API key: environment first, then the Keychain. An empty
+ *  env var counts as absent, so `export OPENROUTER_API_KEY=` cannot mask a
+ *  keychain key. */
+export function resolveProviderKey(provider: string): string | undefined {
+  const preset = EMBED_PROVIDERS[provider];
+  const envName = preset?.keyEnv ?? `${provider.toUpperCase()}_API_KEY`;
+  const fromEnv = process.env[envName];
+  if (fromEnv) return fromEnv;
+  const service = KEYCHAIN_SERVICES[provider];
+  return service ? readKeyFromKeychain(service) : undefined;
+}
+
 /** Parse a strategy name from env, ignoring unknown values. */
 export function readStrategy(value: string | undefined): LocalStrategy | undefined {
   const known: LocalStrategy[] = ["legacy", "bm25", "dense", "fusion", "fusion+rerank"];
@@ -1796,7 +1838,8 @@ export default function piMem0Cache(pi: ExtensionAPI): void {
   void embed?.ensure();
 
   pi.registerCommand("mem0-cache", {
-    description: "mem0 read cache: /mem0-cache [stats|sync|refresh|clear|clear-all|path|shadow|embed|pull-all]",
+    description:
+      "mem0 read cache: /mem0-cache [stats|provider|sync|refresh|clear|clear-all|path|shadow|embed|embed refresh|pull-all]",
     handler: async (args, ctx) => {
       const sub = (args ?? "").trim() || "stats";
       switch (sub) {
@@ -1902,6 +1945,34 @@ export default function piMem0Cache(pi: ExtensionAPI): void {
                 .join("\n");
           }
           ctx.ui.notify(msg, "info");
+          break;
+        }
+        case "provider": {
+          // Credential and health report. Never prints a key value — only the
+          // source it came from and the last error the provider returned.
+          const lines: string[] = [];
+          for (const [name, preset] of Object.entries(EMBED_PROVIDERS)) {
+            const envSet = Boolean(process.env[preset.keyEnv]);
+            const keychain = readKeyFromKeychain(KEYCHAIN_SERVICES[name] ?? "");
+            const source = envSet ? `env ${preset.keyEnv}` : keychain ? `keychain (${KEYCHAIN_SERVICES[name]})` : "none";
+            lines.push(
+              `${name.padEnd(11)} ${source.padEnd(38)} default model ${preset.model}`,
+            );
+          }
+          const active = embedder ? `${embedder.model}` : "none (local reads use BM25 only)";
+          lines.push(``, `active embedder: ${active}`);
+          lines.push(`serving strategy: ${localStrategy ?? "fusion (default)"}`);
+          lines.push(`test mode: ${testMode ? "on" : "off"}`);
+          if (embed) {
+            const s = embed.status();
+            lines.push(
+              `embed layer: ${s.vectors}/${s.corpus} vectors` +
+                `${s.lastError ? ` | last error: ${s.lastError}` : ""}` +
+                `${s.cooldownUntil ? ` | cooling down` : ""}`,
+            );
+          }
+          lines.push(``, `add a key:  ./scripts/setup-key.sh ${Object.keys(EMBED_PROVIDERS).join("|")}`);
+          ctx.ui.notify(`mem0-cache provider:\n${lines.join("\n")}`, embedder ? "info" : "warning");
           break;
         }
         case "embed": {
