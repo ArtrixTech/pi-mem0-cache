@@ -42,6 +42,18 @@ const DEFAULT_EMBED_MODEL = "jina-embeddings-v5-text-nano";
 const EMBED_COOLDOWN_MS = 60 * 1000;
 const WRAPPED = Symbol.for("pi-mem0-cache.wrapped");
 const MAX_FALLBACK_RESULTS = 10;
+/** Harvest guard: memories longer than this are truncated. A single 250K-char
+ *  terminal paste once made up 23% of the corpus and poisoned both the keyword
+ *  ranking and the embedding mean-pooling. Override with MEM0_MAX_MEMORY_CHARS. */
+export const MAX_MEMORY_CHARS =
+  Number(process.env.MEM0_MAX_MEMORY_CHARS) > 0 ? Number(process.env.MEM0_MAX_MEMORY_CHARS) : 4000;
+const DEFAULT_QUARANTINE_PATH = join(homedir(), ".pi", "agent", "mem0-quarantine.jsonl");
+
+/** Optional metadata attached to a harvested memory whose text was truncated. */
+export interface MemoryOverflow {
+  originalChars: number;
+  truncatedAt: number;
+}
 
 interface CachedResponse {
   status: number;
@@ -60,6 +72,8 @@ export interface LocalMemory {
    *  write fell back locally — replayed verbatim on sync so scope params
    *  (user_id, app_id, …) survive. */
   addPayload?: Record<string, unknown>;
+  /** Present when the harvested text exceeded MAX_MEMORY_CHARS. */
+  overflow?: MemoryOverflow;
   [key: string]: unknown;
 }
 
@@ -103,6 +117,8 @@ export interface Store {
     fallbacks: number;
     localWrites: number;
     gated: number;
+    /** Memories whose text was truncated by the harvest guard. */
+    harvestDropped: number;
   };
 }
 
@@ -114,7 +130,7 @@ export function emptyStore(): Store {
     ops: [],
     syncState: {},
     netState: {},
-    stats: { hits: 0, misses: 0, passthroughs: 0, staleServed: 0, fallbacks: 0, localWrites: 0, gated: 0 },
+    stats: { hits: 0, misses: 0, passthroughs: 0, staleServed: 0, fallbacks: 0, localWrites: 0, gated: 0, harvestDropped: 0 },
   };
 }
 
@@ -243,6 +259,25 @@ function cacheKey(req: ClassifiedRequest): string {
 // ---------------------------------------------------------------------------
 // Local memory operations
 
+/** Slice at the cap without leaving a lone surrogate half at the boundary. */
+function truncateSafe(text: string, cap: number): string {
+  const sliced = text.slice(0, cap);
+  const last = sliced.charCodeAt(sliced.length - 1);
+  return last >= 0xd800 && last <= 0xdbff ? sliced.slice(0, -1) : sliced;
+}
+
+/** Append the full original text of a truncated memory to the quarantine
+ *  sidecar, so nothing the guard dropped becomes unrecoverable. */
+function appendQuarantine(entry: { id: string; chars: number; memory: string }): void {
+  const path = process.env.MEM0_HARVEST_QUARANTINE_PATH ?? DEFAULT_QUARANTINE_PATH;
+  try {
+    mkdirSync(dirname(path), { recursive: true });
+    appendFileSync(path, `${JSON.stringify(entry)}\n`);
+  } catch (err) {
+    console.warn("[pi-mem0-cache] failed to append quarantine entry:", err);
+  }
+}
+
 export function harvestMemories(store: Store, bodyText: string): void {
   let parsed: unknown;
   try {
@@ -262,14 +297,23 @@ export function harvestMemories(store: Store, bodyText: string): void {
     const existing = store.memories[m.id];
     // Never let an observed copy overwrite a local write.
     if (existing?.source === "local") continue;
+    let text = m.memory;
+    let overflow: MemoryOverflow | undefined;
+    if (text.length > MAX_MEMORY_CHARS) {
+      overflow = { originalChars: text.length, truncatedAt: MAX_MEMORY_CHARS };
+      appendQuarantine({ id: m.id, chars: text.length, memory: text });
+      text = truncateSafe(text, MAX_MEMORY_CHARS);
+      store.stats.harvestDropped = (store.stats.harvestDropped ?? 0) + 1;
+    }
     store.memories[m.id] = {
       ...m,
       id: m.id,
-      memory: m.memory,
+      memory: text,
       created_at: typeof m.created_at === "string" ? m.created_at : new Date().toISOString(),
       updated_at: typeof m.updated_at === "string" ? m.updated_at : new Date().toISOString(),
       deleted: false,
       source: "observed",
+      ...(overflow ? { overflow } : {}),
     } as LocalMemory;
   }
 }

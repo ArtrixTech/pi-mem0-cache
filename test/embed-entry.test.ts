@@ -127,7 +127,9 @@ describe("extension entry embedding wiring", () => {
     vi.stubEnv("MEM0_CACHE_PATH", storePath);
     vi.stubEnv("MEM0_VECTORS_PATH", join(tmp, `vectors-${run}.json`));
     vi.stubEnv("MEM0_CONFIG_PATH", join(tmp, "no-config.json")); // isolate from the real key on this machine
-    // no JINA_API_KEY
+    // No JINA_API_KEY: blank the real env var too, otherwise the env branch of
+    // createDefaultEmbedder() wins and the layer stays enabled.
+    vi.stubEnv("JINA_API_KEY", "");
     globalThis.fetch = (async () => {
       throw new Error("must not touch the network");
     }) as typeof fetch;
