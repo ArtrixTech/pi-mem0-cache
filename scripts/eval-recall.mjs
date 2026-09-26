@@ -137,6 +137,25 @@ function searchBm25(index, query, limit) {
     .slice(0, limit);
 }
 
+/**
+ * Reciprocal Rank Fusion over rank lists, mirroring src/recall/fusion.ts.
+ * Only ranks matter, so BM25 scores, cosine similarities and legacy hit counts
+ * can be fused without calibration.
+ */
+function fuseRrf(lists, limit, k = 60) {
+  const acc = new Map();
+  for (const hits of lists) {
+    for (let rank = 0; rank < hits.length; rank++) {
+      const id = hits[rank].id;
+      acc.set(id, (acc.get(id) ?? 0) + 1 / (k + rank + 1));
+    }
+  }
+  return [...acc.entries()]
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .slice(0, limit)
+    .map(([id, score]) => ({ id, score }));
+}
+
 // ---------------------------------------------------------------------------
 // Load data
 
@@ -219,10 +238,87 @@ console.log(`mean corpus length: ${mean(corpus.map((m) => m.memory.length)).toFi
 
 const index = buildBm25Index(corpus);
 
+// Per-query cached rankings, so each scorer runs once per query.
+const bm25Cache = new Map();
+const rankBm25 = (q) => {
+  if (!bm25Cache.has(q)) bm25Cache.set(q, searchBm25(index, q, LIMIT));
+  return bm25Cache.get(q);
+};
+
 const results = [
   evaluate("legacy (single-char includes)", (q) => searchLegacy(corpus, q, LIMIT)),
-  evaluate("bm25 + cjk bigram", (q) => searchBm25(index, q, LIMIT)),
+  evaluate("bm25 + cjk bigram", (q) => rankBm25(q)),
+  evaluate("bm25 + cjk bigram (top50)", (q) => searchBm25(index, q, 50)),
 ];
+
+// Fusion column: only meaningful on the subset of queries that carry a recorded
+// dense ranking (the embedding layer was live between 2026-09-05 and 09-17).
+const denseRows = shadow.filter((e) => Array.isArray(e.localVec));
+if (denseRows.length > 0) {
+  const fused = { name: "fusion (bm25+dense)", rows: [] };
+  for (const e of denseRows) {
+    const local = fuseRrf([rankBm25(e.query), e.localVec], LIMIT);
+    fused.rows.push({
+      query: e.query,
+      overlap5: overlapAt(local, e.remote, 5),
+      overlap10: overlapAt(local, e.remote, 10),
+      mrr: reciprocalRank(local, e.remote),
+      empty: local.length === 0,
+      remoteEmpty: e.remote.length === 0,
+      top1InLocal: local.slice(0, 10).some((h) => h.id === e.remote[0]?.id),
+    });
+  }
+  const scored = fused.rows.filter((r) => !r.remoteEmpty);
+  results.push({
+    name: fused.name,
+    n: scored.length,
+    overlap5: mean(scored.map((r) => r.overlap5)),
+    overlap10: mean(scored.map((r) => r.overlap10)),
+    mrr: mean(scored.map((r) => r.mrr)),
+    top1: scored.filter((r) => r.mrr === 1).length / (scored.length || 1),
+    top1Anywhere: scored.filter((r) => r.top1InLocal).length / (scored.length || 1),
+    zero: scored.filter((r) => r.overlap5 === 0).length / (scored.length || 1),
+    empty: scored.filter((r) => r.empty).length / (scored.length || 1),
+    rows: fused.rows,
+    subset: true,
+  });
+
+  // Same-subset comparison: on these queries we also have the recorded dense
+  // and legacy rankings, so all four scorers can be compared on one denominator.
+  const onSubset = (pick) => {
+    const scored2 = denseRows.filter((r) => r.remote.length > 0);
+    return {
+      n: scored2.length,
+      overlap5: mean(scored2.map((r) => pick(r).overlap5)),
+      overlap10: mean(scored2.map((r) => pick(r).overlap10)),
+      mrr: mean(scored2.map((r) => pick(r).mrr)),
+      top1: scored2.filter((r) => pick(r).mrr === 1).length / (scored2.length || 1),
+    };
+  };
+  const subsetView = [
+    { name: "legacy", ...onSubset((r) => r) },
+    ...(denseRows[0].overlapBm25_5 !== undefined
+      ? [
+          {
+            name: "bm25",
+            ...onSubset(() => ({ overlap5: 0, overlap10: 0, mrr: 0 })),
+          },
+        ]
+      : []),
+    {
+      name: "dense",
+      ...onSubset((r) => ({ overlap5: r.overlapVec5 ?? 0, overlap10: r.overlapVec10 ?? 0, mrr: r.mrrVec ?? 0 })),
+    },
+    {
+      name: "fusion",
+      ...onSubset((r) => {
+        const local = fuseRrf([rankBm25(r.query), r.localVec], LIMIT);
+        return { overlap5: overlapAt(local, r.remote, 5), overlap10: overlapAt(local, r.remote, 10), mrr: reciprocalRank(local, r.remote) };
+      }),
+    },
+  ];
+  results.push({ name: "__subset__", subsetView });
+}
 
 const pct = (x) => `${(x * 100).toFixed(1)}%`;
 const f = (x) => x.toFixed(3);
@@ -230,18 +326,34 @@ const f = (x) => x.toFixed(3);
 console.log("scorer                        overlap@5   overlap@10   MRR      top1     top1@10   zero@5   empty");
 console.log("-".repeat(103));
 for (const r of results) {
+  if (r.name === "__subset__") continue;
   console.log(
     `${r.name.padEnd(28)}  ${f(r.overlap5).padStart(8)}   ${f(r.overlap10).padStart(10)}   ${f(r.mrr).padStart(6)}   ${pct(r.top1).padStart(6)}   ${pct(r.top1Anywhere).padStart(7)}   ${pct(r.zero).padStart(6)}   ${pct(r.empty).padStart(5)}`,
   );
 }
 console.log("");
 
+const subsetView = results.find((r) => r.name === "__subset__")?.subsetView;
+if (subsetView) {
+  console.log("same-subset head-to-head (queries carrying a recorded dense ranking):");
+  console.log(`  n = ${subsetView[0].n}`);
+  console.log("  scorer    overlap@5   overlap@10   MRR      top1");
+  console.log("  " + "-".repeat(58));
+  for (const r of subsetView) {
+    console.log(
+      `  ${r.name.padEnd(8)}  ${f(r.overlap5).padStart(8)}   ${f(r.overlap10).padStart(10)}   ${f(r.mrr).padStart(6)}   ${pct(r.top1).padStart(6)}`,
+    );
+  }
+  console.log("");
+}
+
 // Per-scorer wins, restricted to queries where the two disagree at all
-const [legacy, bm25] = results;
-const deltas = legacy.rows.map((r, i) => ({
+const [legacyResult] = results;
+const bm25Result = results.find((r) => r.name.startsWith("bm25 + cjk bigram"));
+const deltas = legacyResult.rows.map((r, i) => ({
   query: r.query,
-  dOverlap5: bm25.rows[i].overlap5 - r.overlap5,
-  dMrr: bm25.rows[i].mrr - r.mrr,
+  dOverlap5: bm25Result.rows[i].overlap5 - r.overlap5,
+  dMrr: bm25Result.rows[i].mrr - r.mrr,
 }));
 const better = deltas.filter((d) => d.dOverlap5 > 0 || d.dMrr > 0).length;
 const worse = deltas.filter((d) => d.dOverlap5 < 0 || d.dMrr < 0).length;
@@ -250,11 +362,11 @@ console.log(`queries where bm25 ranks worse:  ${worse}`);
 console.log(`unchanged:                       ${deltas.length - better - worse}`);
 
 // Worst remaining failures, to drive the next iteration
-const worst = bm25.rows
-  .map((r, i) => ({ ...r, legacyOverlap5: legacy.rows[i].overlap5 }))
+const worst = bm25Result.rows
+  .map((r, i) => ({ ...r, legacyOverlap5: legacyResult.rows[i].overlap5 }))
   .filter((r) => r.overlap5 === 0)
   .slice(0, 12);
-console.log(`\nbm25 still-zero queries (${bm25.rows.filter((r) => r.overlap5 === 0).length} total), first 12:`);
+console.log(`\nbm25 still-zero queries (${bm25Result.rows.filter((r) => r.overlap5 === 0).length} total), first 12:`);
 for (const r of worst) {
   console.log(`  [legacy=${r.legacyOverlap5} remoteTop=${r.remoteTop ?? ""}] ${r.query.slice(0, 90).replace(/\n/g, " ")}`);
 }
@@ -263,7 +375,12 @@ if (JSON_OUT) {
   writeFileSync(
     JSON_OUT,
     JSON.stringify(
-      { corpus: corpus.length, queries: shadow.length, results: results.map(({ rows, ...r }) => r) },
+      {
+        corpus: corpus.length,
+        queries: shadow.length,
+        results: results.map(({ rows, subsetView: sv, ...r }) => r),
+        subsetView: subsetView ?? undefined,
+      },
       null,
       2,
     ),

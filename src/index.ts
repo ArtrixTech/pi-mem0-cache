@@ -28,6 +28,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { LexicalChannel, recall, type ChannelHit, type ChannelStatus, type FusedHit, type RecallChannel } from "./recall/fusion.js";
 
 const DEFAULT_STORE_PATH = join(homedir(), ".pi", "agent", "mem0-cache.json");
 const DEFAULT_TTL_MS = 24 * 60 * 60 * 1000;
@@ -39,6 +40,19 @@ const SHADOW_KEEP_LINES = 2000;
 const DEFAULT_VECTORS_PATH = join(homedir(), ".pi", "agent", "mem0-vectors.json");
 const DEFAULT_MEM0_CONFIG_PATH = join(homedir(), ".pi", "agent", "mem0-config.json");
 const DEFAULT_EMBED_MODEL = "jina-embeddings-v5-text-nano";
+/** Providers the embedding layer can talk to. All are OpenAI-compatible. */
+export const EMBED_PROVIDERS: Record<string, { endpoint: string; keyEnv: string; model: string }> = {
+  jina: {
+    endpoint: "https://api.jina.ai/v1/embeddings",
+    keyEnv: "JINA_API_KEY",
+    model: "jina-embeddings-v5-text-nano",
+  },
+  openrouter: {
+    endpoint: "https://openrouter.ai/api/v1/embeddings",
+    keyEnv: "OPENROUTER_API_KEY",
+    model: "qwen/qwen3-embedding-8b",
+  },
+};
 const EMBED_COOLDOWN_MS = 60 * 1000;
 const WRAPPED = Symbol.for("pi-mem0-cache.wrapped");
 const MAX_FALLBACK_RESULTS = 10;
@@ -119,6 +133,10 @@ export interface Store {
     gated: number;
     /** Memories whose text was truncated by the harvest guard. */
     harvestDropped: number;
+    /** Strategy that served the most recent local read (test mode). */
+    lastStrategy?: LocalStrategy;
+    /** Set when that strategy could not run as requested. */
+    lastStrategyDegraded?: string;
   };
 }
 
@@ -346,6 +364,107 @@ export function searchLocal(store: Store, query: string, limit = MAX_FALLBACK_RE
   return searchLocalScored(store, query, limit).map((s) => s.m);
 }
 
+// ---------------------------------------------------------------------------
+// Local read strategies
+
+/** Live corpus of a store, as BM25 docs. */
+function liveDocs(store: Store): { id: string; text: string }[] {
+  return Object.values(store.memories)
+    .filter((m) => !m.deleted)
+    .map((m) => ({ id: m.id, text: m.memory }));
+}
+
+/** Resolve an id list back to memories, dropping any that vanished or are
+ *  tombstoned between ranking and response. */
+function materialize(store: Store, ids: string[], limit: number): LocalMemory[] {
+  const out: LocalMemory[] = [];
+  for (const id of ids) {
+    const m = store.memories[id];
+    if (m && !m.deleted) out.push(m);
+    if (out.length >= limit) break;
+  }
+  return out;
+}
+
+/**
+ * Rank the mirror for one query under the configured strategy.
+ *
+ * Strategy resolution happens per call so a test-mode switch takes effect on the
+ * next read rather than at session start. Every strategy is answerable: "dense"
+ * degrades to "bm25" when the embed harness returns nothing, and
+ * "fusion+rerank" degrades to "fusion" without a reranker, so no configuration
+ * can leave local reads unanswerable.
+ */
+export async function rankLocal(
+  store: Store,
+  query: string,
+  opts: {
+    embed?: EmbedHarness;
+    localStrategy?: LocalStrategy;
+    reranker?: Reranker;
+    onStrategy?: (info: { strategy: LocalStrategy; degraded?: string; channels: ChannelStatus[] }) => void;
+  } = {},
+  limit = MAX_FALLBACK_RESULTS,
+): Promise<LocalMemory[]> {
+  const requested = opts.localStrategy ?? "fusion";
+  const channels: RecallChannel[] = [];
+  const notes: ChannelStatus[] = [];
+
+  if (requested === "legacy") {
+    return searchLocal(store, query, limit);
+  }
+
+  if (requested !== "dense") {
+    channels.push(new LexicalChannel({ docs: liveDocs(store) }));
+  }
+  if (requested !== "bm25" && opts.embed) {
+    channels.push(new EmbedHarnessChannel(opts.embed));
+  }
+
+  let degraded: string | undefined;
+  if (channels.length === 0) {
+    // "dense" requested but nothing to serve it: fall back to lexical rather
+    // than answering nothing.
+    degraded = `no channel for strategy "${requested}"`;
+    channels.push(new LexicalChannel({ docs: liveDocs(store) }));
+  }
+
+  const reranker =
+    requested === "fusion+rerank" && opts.reranker
+      ? (q: string, c: FusedHit[]) => opts.reranker!(q, c)
+      : undefined;
+  if (requested === "fusion+rerank" && !opts.reranker) degraded = "no reranker configured";
+
+  const result = await recall({
+    query,
+    channels,
+    perChannelLimit: 50,
+    fusedLimit: limit,
+    reranker,
+  });
+
+  let strategy: LocalStrategy = requested;
+  if (degraded) strategy = channels.some((c) => c.name === "lexical") ? "bm25" : requested;
+
+  opts.onStrategy?.({ strategy, degraded, channels: result.status });
+  const ids = result.hits.map((h) => h.id);
+  return materialize(store, ids, limit);
+}
+
+/** Adapts the embedding harness' search to the channel interface. */
+class EmbedHarnessChannel implements RecallChannel {
+  readonly name = "dense";
+  constructor(private embed: EmbedHarness) {}
+  async search(query: string): Promise<ChannelHit[]> {
+    const hits = await this.embed.search(query);
+    if (!hits) throw new Error(this.embed.status().lastError ?? "embedding layer unavailable");
+    return hits.map((h) => ({ id: h.m.id, score: h.score }));
+  }
+}
+
+/** Cross-encoder reranking of a fused candidate pool. */
+export type Reranker = (query: string, candidates: FusedHit[]) => Promise<ChannelHit[]>;
+
 function stripInternal(m: LocalMemory): Record<string, unknown> {
   const { deleted, source, ...rest } = m;
   return rest;
@@ -485,6 +604,22 @@ export interface ShadowEntry {
   overlapVec5?: number;
   overlapVec10?: number;
   mrrVec?: number;
+  /** BM25-only ranking side — the lexical floor, logged next to `local` (the
+   *  legacy scorer) so the two compare on identical live traffic. */
+  localBm25?: ShadowLocalHit[];
+  overlapBm25_5?: number;
+  overlapBm25_10?: number;
+  mrrBm25?: number;
+  /** Fused (lexical + dense, RRF) ranking side, stored as ids. */
+  localFusion?: string[];
+  overlapFusion5?: number;
+  overlapFusion10?: number;
+  mrrFusion?: number;
+  /** Query terms BM25 found nowhere in the corpus — a vocabulary-gap signal
+   *  that separates "no lexical signal" from "lexical signal misranked". */
+  unmatched?: string[];
+  /** Per-channel failures observed while building this entry. */
+  channelErrors?: Record<string, string>;
 }
 
 export function compareShadow(
@@ -516,6 +651,15 @@ export interface ShadowSummary {
   meanOverlapVec10: number;
   meanMrrVec: number;
   top1VecRecall: number;
+  bm25Comparisons: number;
+  meanOverlapBm25_5: number;
+  meanOverlapBm25_10: number;
+  meanMrrBm25: number;
+  fusionComparisons: number;
+  meanOverlapFusion5: number;
+  meanOverlapFusion10: number;
+  meanMrrFusion: number;
+  top1FusionRecall: number;
 }
 
 export function summarizeShadow(entries: ShadowEntry[]): ShadowSummary {
@@ -525,6 +669,13 @@ export function summarizeShadow(entries: ShadowEntry[]): ShadowSummary {
   const withVec = remote.filter((e) => e.localVec !== undefined);
   const nv = withVec.length;
   const meanVec = (pick: (e: ShadowEntry) => number) => (nv === 0 ? 0 : withVec.reduce((sum, e) => sum + pick(e), 0) / nv);
+  const withBm25 = remote.filter((e) => e.mrrBm25 !== undefined);
+  const nb = withBm25.length;
+  const meanBm25 = (pick: (e: ShadowEntry) => number) => (nb === 0 ? 0 : withBm25.reduce((sum, e) => sum + pick(e), 0) / nb);
+  const withFusion = remote.filter((e) => e.mrrFusion !== undefined);
+  const nfu = withFusion.length;
+  const meanFusion = (pick: (e: ShadowEntry) => number) =>
+    nfu === 0 ? 0 : withFusion.reduce((sum, e) => sum + pick(e), 0) / nfu;
   return {
     comparisons: n,
     fallbacks: entries.length - n,
@@ -538,7 +689,23 @@ export function summarizeShadow(entries: ShadowEntry[]): ShadowSummary {
     meanOverlapVec10: meanVec((e) => e.overlapVec10 ?? 0),
     meanMrrVec: meanVec((e) => e.mrrVec ?? 0),
     top1VecRecall: nv === 0 ? 0 : withVec.filter((e) => (e.mrrVec ?? 0) > 0).length / nv,
+    bm25Comparisons: nb,
+    meanOverlapBm25_5: meanBm25((e) => e.overlapBm25_5 ?? 0),
+    meanOverlapBm25_10: meanBm25((e) => e.overlapBm25_10 ?? 0),
+    meanMrrBm25: meanBm25((e) => e.mrrBm25 ?? 0),
+    fusionComparisons: nfu,
+    meanOverlapFusion5: meanFusion((e) => e.overlapFusion5 ?? 0),
+    meanOverlapFusion10: meanFusion((e) => e.overlapFusion10 ?? 0),
+    meanMrrFusion: meanFusion((e) => e.mrrFusion ?? 0),
+    top1FusionRecall: nfu === 0 ? 0 : withFusion.filter((e) => (e.mrrFusion ?? 0) > 0).length / nfu,
   };
+}
+
+/** Fraction of comparisons where the given MRR field equals 1 (top-1 exact). */
+function top1RateOf(entries: ShadowEntry[], field: keyof ShadowEntry): number {
+  const vals = entries.filter((e) => e.mode === "remote" && typeof e[field] === "number");
+  if (vals.length === 0) return 0;
+  return vals.filter((e) => e[field] === 1).length / vals.length;
 }
 
 /** Append one entry, then compact the file once it exceeds rotateBytes,
@@ -601,6 +768,20 @@ function remoteSearchHits(body: string | null): ShadowRemoteHit[] {
  *  reflect what a freshness-gated read would have served from the mirror.
  *  Keyword ranking is always recorded; the vector ranking is added when the
  *  embedding layer answers. */
+/** Test mode: a single shadow entry records what *every* strategy would have
+ *  answered, so strategies are compared on identical live traffic. The remote
+ *  ranking is the shared ground truth; `served` names the one the agent saw. */
+export interface ShadowStrategyRanking {
+  /** ids in rank order (top 10), so any strategy can be scored post-hoc from the
+   *  log without reproducing its internals. */
+  ids: string[];
+  overlap5: number;
+  overlap10: number;
+  mrr: number;
+  /** Populated when the strategy could not run (provider down, etc.). */
+  error?: string;
+}
+
 async function recordShadow(
   log: (entry: ShadowEntry) => void,
   mode: ShadowEntry["mode"],
@@ -610,19 +791,68 @@ async function recordShadow(
   embed?: EmbedHarness,
 ): Promise<void> {
   const remote = remoteSearchHits(remoteBody);
-  const local = searchLocalScored(store, req.query ?? "", 10).map(({ m, score }) => ({ id: m.id, score }));
+  const query = req.query ?? "";
+  const local = searchLocalScored(store, query, 10).map(({ m, score }) => ({ id: m.id, score }));
   const { overlap5, overlap10, mrr } = compareShadow(local, remote);
   const entry: ShadowEntry = {
     ts: Date.now(),
     mode,
-    query: (req.query ?? "").slice(0, 200),
+    query: query.slice(0, 200),
     local,
     remote,
     overlap5,
     overlap10,
     mrr,
   };
-  const vecRanked = embed ? await embed.search(req.query ?? "").catch(() => null) : null;
+
+  // BM25 ranking — the new lexical floor, logged on the same entry so the
+  // legacy-vs-BM25 comparison comes from live traffic rather than a replay.
+  const lexicalChannel = new LexicalChannel({ docs: liveDocs(store) });
+  const bm25Hits = lexicalChannel.search(query, 10) as ChannelHit[];
+  const bm25Ids = bm25Hits.map((h) => h.id);
+  if (bm25Ids.length > 0) {
+    const bm = compareShadow(
+      bm25Ids.map((id) => ({ id })),
+      remote,
+    );
+    entry.localBm25 = bm25Ids.map((id, i) => ({ id, score: Number((bm25Hits[i].score ?? 0).toFixed(4)) }));
+    entry.overlapBm25_5 = bm.overlap5;
+    entry.overlapBm25_10 = bm.overlap10;
+    entry.mrrBm25 = bm.mrr;
+    entry.unmatched = lexicalChannel.unmatched(query).slice(0, 10);
+  }
+
+  // Fused (and reranked, when configured) ranking — what the fusion strategy
+  // would have served. Recorded as ids so it survives any later scorer change.
+  if (embed) {
+    try {
+      const result = await recall({
+        query,
+        channels: [new LexicalChannel({ docs: liveDocs(store) }), new EmbedHarnessChannel(embed)],
+        perChannelLimit: 50,
+        fusedLimit: 10,
+      });
+      const fusedIds = result.hits.map((h) => h.id);
+      if (fusedIds.length > 0) {
+        const f = compareShadow(
+          fusedIds.map((id) => ({ id })),
+          remote,
+        );
+        entry.localFusion = fusedIds;
+        entry.overlapFusion5 = f.overlap5;
+        entry.overlapFusion10 = f.overlap10;
+        entry.mrrFusion = f.mrr;
+      }
+      const failed = result.status.filter((s) => !s.ok);
+      if (failed.length > 0) {
+        entry.channelErrors = Object.fromEntries(failed.map((s) => [s.name, s.error ?? "unknown"]));
+      }
+    } catch (err) {
+      entry.channelErrors = { fusion: err instanceof Error ? err.message : String(err) };
+    }
+  }
+
+  const vecRanked = embed ? await embed.search(query).catch(() => null) : null;
   if (vecRanked) {
     const localVec = vecRanked.slice(0, 10).map(({ m, score }) => ({ id: m.id, score: Number(score.toFixed(4)) }));
     const vec = compareShadow(localVec, remote);
@@ -704,23 +934,58 @@ export function createJinaEmbedder(
   model = DEFAULT_EMBED_MODEL,
   fetchImpl: typeof fetch = (...args) => globalThis.fetch(...args),
 ): Embedder {
-  return {
+  return createOpenAiCompatEmbedder({
+    apiKey,
     model,
+    endpoint: process.env.MEM0_EMBED_ENDPOINT ?? "https://api.jina.ai/v1/embeddings",
+    label: "embeddings",
+    fetchImpl,
+  });
+}
+
+/**
+ * Any OpenAI-compatible /v1/embeddings provider (Jina, OpenRouter, Voyage,
+ * local Ollama, …). The wire shape is identical across all of them: POST
+ * {model, input: string[]} -> {data: [{embedding, index}]}. Provider choice is
+ * therefore configuration, not code — which is what makes the provider swap and
+ * the test-mode A/B a config change rather than a refactor.
+ */
+export interface OpenAiCompatEmbedderOptions {
+  apiKey: string;
+  model: string;
+  endpoint: string;
+  /** Prefix for thrown error messages, e.g. "openrouter". */
+  label?: string;
+  fetchImpl?: typeof fetch;
+  timeoutMs?: number;
+}
+
+export function createOpenAiCompatEmbedder(opts: OpenAiCompatEmbedderOptions): Embedder {
+  const fetchImpl = opts.fetchImpl ?? ((...args: Parameters<typeof fetch>) => globalThis.fetch(...args));
+  const label = opts.label ?? "embeddings";
+  const timeoutMs = opts.timeoutMs ?? 15_000;
+  return {
+    model: opts.model,
     async embed(texts: string[]): Promise<number[][]> {
       if (texts.length === 0) return [];
-      const res = await fetchImpl("https://api.jina.ai/v1/embeddings", {
+      const res = await fetchImpl(opts.endpoint, {
         method: "POST",
-        headers: { "content-type": "application/json", authorization: `Bearer ${apiKey}` },
-        body: JSON.stringify({ model, input: texts }),
-        signal: AbortSignal.timeout(15_000),
+        headers: { "content-type": "application/json", authorization: `Bearer ${opts.apiKey}` },
+        body: JSON.stringify({ model: opts.model, input: texts }),
+        signal: AbortSignal.timeout(timeoutMs),
       });
-      if (!res.ok) throw new Error(`jina embeddings HTTP ${res.status}`);
+      if (!res.ok) {
+        // Surface the provider's own message: a bare status code is what let a
+        // 403 "insufficient balance" sit unnoticed for nine days.
+        const body = await res.clone().text().catch(() => "");
+        throw new Error(`${label} ${res.status}: ${body.slice(0, 200) || "no body"}`);
+      }
       const parsed = (await res.json()) as { data?: { embedding?: unknown; index?: number }[] };
       const data = Array.isArray(parsed.data) ? [...parsed.data] : [];
       data.sort((a, b) => (a.index ?? 0) - (b.index ?? 0));
       const vecs = data.map((d) => (Array.isArray(d.embedding) ? (d.embedding as number[]) : null));
       if (vecs.length === 0 || vecs.some((v) => !v || v.length === 0)) {
-        throw new Error("jina embeddings: malformed response body");
+        throw new Error(`${label}: malformed response body`);
       }
       return vecs as number[][];
     },
@@ -874,17 +1139,39 @@ export function createEmbedHarness(
   return { ensure, search, status, refresh };
 }
 
-/** Default provider selection: JINA_API_KEY env first, then `jinaApiKey` in
- *  mem0-config.json (same file that already holds the mem0 key) — so the
- *  embedding layer survives terminal environments that don't source ~/.zshrc.
- *  MEM0_EMBED=0 forces off regardless. */
+/** Default provider selection, in order: MEM0_EMBED_PROVIDER, then any provider
+ *  whose API key is present (openrouter before jina, since one key covers both
+ *  embed and rerank), then `jinaApiKey` from mem0-config.json. MEM0_EMBED=0
+ *  forces the whole layer off. */
 export function createDefaultEmbedder(): Embedder | undefined {
   if (process.env.MEM0_EMBED === "0") return undefined;
-  const apiKey = process.env.JINA_API_KEY || readJinaKeyFromConfig(process.env.MEM0_CONFIG_PATH);
-  if (!apiKey) return undefined;
-  return createJinaEmbedder(apiKey, process.env.MEM0_EMBED_MODEL ?? DEFAULT_EMBED_MODEL, (...args) =>
-    globalThis.fetch(...args),
-  );
+  const explicit = process.env.MEM0_EMBED_PROVIDER;
+  const order = explicit ? [explicit] : ["openrouter", "jina"];
+  for (const name of order) {
+    const preset = EMBED_PROVIDERS[name];
+    if (!preset) continue;
+    const apiKey = process.env[preset.keyEnv];
+    if (!apiKey) continue;
+    return createOpenAiCompatEmbedder({
+      apiKey,
+      model: process.env.MEM0_EMBED_MODEL ?? preset.model,
+      endpoint: process.env.MEM0_EMBED_ENDPOINT ?? preset.endpoint,
+      label: name,
+    });
+  }
+  // Last resort: the Jina key stored next to the mem0 key, so a terminal that
+  // never sourced ~/.zshrc still gets embedding.
+  const configKey = readJinaKeyFromConfig(process.env.MEM0_CONFIG_PATH);
+  if (configKey) {
+    const jina = EMBED_PROVIDERS.jina;
+    return createOpenAiCompatEmbedder({
+      apiKey: configKey,
+      model: process.env.MEM0_EMBED_MODEL ?? jina.model,
+      endpoint: process.env.MEM0_EMBED_ENDPOINT ?? jina.endpoint,
+      label: "jina(config)",
+    });
+  }
+  return undefined;
 }
 
 export function readJinaKeyFromConfig(path = DEFAULT_MEM0_CONFIG_PATH): string | undefined {
@@ -971,7 +1258,31 @@ export interface InterceptorOptions {
   /** Shared cell capturing the client's most recent read filters (user_id, …) —
    *  pull-all reuses them minus entity-scoping keys. */
   filtersRef?: { current?: Record<string, unknown> };
+  /** Test mode: when set, local reads are served by the named strategy instead
+   *  of the default fusion, and every served read is written to the shadow log
+   *  with the strategy that produced it — so strategies can be compared on real
+   *  traffic without changing what the agent sees mid-session. */
+  localStrategy?: LocalStrategy;
+  /** Cross-encoder reranking of the fused pool. Enabled with the
+   *  "fusion+rerank" strategy; absent means that strategy degrades to fusion. */
+  reranker?: Reranker;
+  /** Enable per-strategy shadow comparison on every read-search miss. */
+  testMode?: boolean;
 }
+
+/** How a local (non-network) search read is answered. */
+export type LocalStrategy =
+  /** Legacy single-character keyword scorer. Kept for A/B and fallback. */
+  | "legacy"
+  /** BM25 + CJK bigram only. */
+  | "bm25"
+  /** Embedding cosine only (whatever the embed harness provides). */
+  | "dense"
+  /** BM25 + dense fused with RRF. The default. */
+  | "fusion"
+  /** Fusion, then the reranker reorders the pool. Enabled once a reranker is
+   *  configured; falls back to "fusion" when none is. */
+  | "fusion+rerank";
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -985,14 +1296,31 @@ export function createInterceptor(
   opts: InterceptorOptions,
 ): typeof fetch {
   const { store, save, ttlMs, onFallback, remoteReadIntervalMs = 0 } = opts;
-
   /** Answer a read without the network: stale cache first, then the local
    *  store. Null for reads that can't be synthesized (history, unknown). */
   const serveLocalRead = async (req: ClassifiedRequest, cached?: CachedResponse): Promise<Response | null> => {
     if (cached) return jsonResponse(JSON.parse(cached.body), cached.status);
     if (req.kind === "read-search") {
-      const vecRanked = opts.embed ? await opts.embed.search(req.query ?? "") : null;
-      const ranked: LocalMemory[] = vecRanked ? vecRanked.map((s) => s.m) : searchLocal(store, req.query ?? "");
+      const ranked: LocalMemory[] = await rankLocal(
+        store,
+        req.query ?? "",
+        {
+          embed: opts.embed,
+          localStrategy: opts.localStrategy,
+          reranker: opts.reranker,
+          onStrategy: (info) => {
+            store.stats.lastStrategy = info.strategy;
+            if (info.degraded) {
+              store.stats.lastStrategyDegraded = info.degraded;
+              onFallback?.(
+                `local read strategy "${opts.localStrategy ?? "fusion"}" degraded to "${info.strategy}": ${info.degraded}`,
+              );
+            }
+            const failed = info.channels.filter((c) => !c.ok);
+            for (const c of failed) onFallback?.(`recall channel ${c.name} failed: ${c.error ?? "unknown"}`);
+          },
+        },
+      );
       return jsonResponse({ results: ranked.map(stripInternal) });
     }
     if (req.kind === "read-getall") {
@@ -1392,6 +1720,12 @@ export async function pullAllMemories(opts: PullAllOptions): Promise<PullAllResu
 // ---------------------------------------------------------------------------
 // Extension entry
 
+/** Parse a strategy name from env, ignoring unknown values. */
+export function readStrategy(value: string | undefined): LocalStrategy | undefined {
+  const known: LocalStrategy[] = ["legacy", "bm25", "dense", "fusion", "fusion+rerank"];
+  return value && (known as string[]).includes(value) ? (value as LocalStrategy) : undefined;
+}
+
 export default function piMem0Cache(pi: ExtensionAPI): void {
   const storePath = process.env.MEM0_CACHE_PATH ?? DEFAULT_STORE_PATH;
   const ttlMs = Number(process.env.MEM0_CACHE_TTL_MS) > 0 ? Number(process.env.MEM0_CACHE_TTL_MS) : DEFAULT_TTL_MS;
@@ -1408,6 +1742,15 @@ export default function piMem0Cache(pi: ExtensionAPI): void {
   const saveVectors = makeVectorSaver(vecStore, vectorsPath);
   const embedder = createDefaultEmbedder();
   const embed = embedder ? createEmbedHarness(store, saveVectors, vecStore, embedder) : undefined;
+
+  // -- Test mode ------------------------------------------------------------
+  // MEM0_RECALL_STRATEGY picks what answers local reads; MEM0_RECALL_TEST=1
+  // (or simply setting a strategy) switches the shadow logger into comparison
+  // mode, where every read records what each strategy would have answered
+  // against the same remote ground truth. Test mode changes what is measured,
+  // never what the agent receives.
+  const localStrategy = readStrategy(process.env.MEM0_RECALL_STRATEGY);
+  const testMode = process.env.MEM0_RECALL_TEST === "1" || localStrategy !== undefined;
 
   const g = globalThis as { fetch?: typeof fetch & { [WRAPPED]?: boolean } };
   const authRef: { current?: CapturedAuth } = {};
@@ -1436,6 +1779,8 @@ export default function piMem0Cache(pi: ExtensionAPI): void {
       shadowLog: shadowEnabled ? (entry) => appendShadowLog(shadowPath, entry) : undefined,
       embed,
       filtersRef,
+      localStrategy,
+      testMode,
       onFallback: (reason) => console.warn(`[pi-mem0-cache] ${reason}`),
       onPassthroughSuccess: () => {
         void syncer.maybeSync();
@@ -1494,15 +1839,67 @@ export default function piMem0Cache(pi: ExtensionAPI): void {
           break;
         }
         case "shadow": {
-          const s = summarizeShadow(readShadowEntries(shadowPath));
-          let msg =
-            `mem0-cache shadow: ${s.comparisons} comparisons (${s.fallbacks} fallback) | ` +
-            `overlap@5 ${s.meanOverlap5.toFixed(2)}/5, overlap@10 ${s.meanOverlap10.toFixed(2)}/10 | ` +
-            `remote top-1 in local top-10: ${(s.top1Recall * 100).toFixed(0)}% | MRR ${s.meanMrr.toFixed(2)}`;
+          const entries = readShadowEntries(shadowPath);
+          const s = summarizeShadow(entries);
+          // Strategy comparison table, best-first on MRR. Every column is scored
+          // against the same remote ground truth, so they are directly comparable.
+          const rows: { name: string; n: number; o5: number; o10: number; mrr: number; top1: number }[] = [
+            { name: "legacy", n: s.comparisons, o5: s.meanOverlap5, o10: s.meanOverlap10, mrr: s.meanMrr, top1: s.top1Recall },
+          ];
+          if (s.bm25Comparisons > 0) {
+            rows.push({
+              name: "bm25",
+              n: s.bm25Comparisons,
+              o5: s.meanOverlapBm25_5,
+              o10: s.meanOverlapBm25_10,
+              mrr: s.meanMrrBm25,
+              top1: s.bm25Comparisons === 0 ? 0 : top1RateOf(entries, "mrrBm25"),
+            });
+          }
           if (s.vecComparisons > 0) {
+            rows.push({
+              name: "dense",
+              n: s.vecComparisons,
+              o5: s.meanOverlapVec5,
+              o10: s.meanOverlapVec10,
+              mrr: s.meanMrrVec,
+              top1: s.top1VecRecall,
+            });
+          }
+          if (s.fusionComparisons > 0) {
+            rows.push({
+              name: "fusion",
+              n: s.fusionComparisons,
+              o5: s.meanOverlapFusion5,
+              o10: s.meanOverlapFusion10,
+              mrr: s.meanMrrFusion,
+              top1: s.top1FusionRecall,
+            });
+          }
+          const table = rows
+            .sort((a, b) => b.mrr - a.mrr)
+            .map(
+              (r) =>
+                `${r.name.padEnd(7)} n=${String(r.n).padStart(4)}  o@5 ${r.o5.toFixed(2)}  o@10 ${r.o10.toFixed(2)}  MRR ${r.mrr.toFixed(3)}  top1 ${(r.top1 * 100).toFixed(0)}%`,
+            )
+            .join("\n");
+          let msg = `mem0-cache shadow: ${s.comparisons} comparisons (${s.fallbacks} fallback)\n${table}`;
+          // Per-channel failures are the thing that silently degrades output, so
+          // they get their own line rather than being averaged away.
+          const errs = new Map<string, number>();
+          for (const e of entries) {
+            for (const [k, v] of Object.entries(e.channelErrors ?? {})) {
+              errs.set(`${k}: ${v.slice(0, 60)}`, (errs.get(`${k}: ${v.slice(0, 60)}`) ?? 0) + 1);
+            }
+          }
+          if (errs.size > 0) {
             msg +=
-              ` | vector: ${s.vecComparisons} comparisons, overlap@5 ${s.meanOverlapVec5.toFixed(2)}/5, ` +
-              `top-1 recall ${(s.top1VecRecall * 100).toFixed(0)}%, MRR ${s.meanMrrVec.toFixed(2)}`;
+              "\nchannel errors:\n" +
+              [...errs.entries()]
+                .sort((a, b) => b[1] - a[1])
+                .slice(0, 4)
+                .map(([k, n]) => `  ${n}x ${k}`)
+                .join("\n");
           }
           ctx.ui.notify(msg, "info");
           break;

@@ -64,9 +64,11 @@ describe("createJinaEmbedder", () => {
     expect(vecs).toEqual([[1, 0, 0], [0, 0, 1]]); // sorted by index, not response order
   });
 
-  it("throws on non-ok responses", async () => {
+  it("throws on non-ok responses and includes the provider body", async () => {
     const embedder = createJinaEmbedder("sk-test", undefined, async () => okJson({ detail: "no" }, 401));
-    await expect(embedder.embed(["x"])).rejects.toThrow("HTTP 401");
+    // The status alone is not enough: a dead-balance 403 was swallowed for nine
+    // days precisely because the provider's own message never surfaced.
+    await expect(embedder.embed(["x"])).rejects.toThrow(/401.*detail/);
   });
 });
 
@@ -184,10 +186,13 @@ describe("interceptor with embed harness", () => {
     const vecStore = emptyVectorStore();
     const embed = createEmbedHarness(store, () => {}, vecStore, tableEmbedder());
 
-    // --- gated read: vector ranking wins over keyword ranking ---
+    // --- gated read: the dense channel wins over the legacy keyword ranking ---
+    // Strategy pinned to "dense" so this keeps testing the dense ranking itself;
+    // the default ("fusion") fuses dense with BM25 via RRF, which is a different
+    // question tested in test/fusion.test.ts.
     const gatedInterceptor = createInterceptor(async () => {
       throw new Error("gated reads must not touch the network");
-    }, { store, save: () => {}, ttlMs: 0, remoteReadIntervalMs: 60 * 60 * 1000, embed });
+    }, { store, save: () => {}, ttlMs: 0, remoteReadIntervalMs: 60 * 60 * 1000, embed, localStrategy: "dense" });
     store.netState.lastRemoteReadAt = Date.now() - 1000;
     const gated = await gatedInterceptor(...searchRequest("veeam 查询"));
     const gatedBody = (await gated.json()) as { results: { id: string }[] };

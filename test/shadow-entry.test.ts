@@ -53,6 +53,10 @@ describe("extension entry shadow wiring", () => {
     let message = "";
     await handler!("shadow", { ui: { notify: (msg: string) => { message = msg; } } });
     expect(message).toContain("1 comparisons");
-    expect(message).toContain("overlap@5");
+    // Strategy comparison table: one row per scorer present in the log, each
+    // scored against the same remote ground truth.
+    expect(message).toContain("legacy");
+    expect(message).toContain("o@5");
+    expect(message).toContain("MRR");
   });
 });

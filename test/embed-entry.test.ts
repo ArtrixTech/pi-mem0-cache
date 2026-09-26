@@ -43,6 +43,9 @@ describe("extension entry embedding wiring", () => {
     vi.stubEnv("MEM0_CACHE_SHADOW_PATH", join(tmp, `shadow-${run}.jsonl`));
     vi.stubEnv("MEM0_VECTORS_PATH", join(tmp, `vectors-${run}.json`));
     vi.stubEnv("JINA_API_KEY", "sk-entry-test");
+    // Pin the dense strategy: this test covers the embedding wiring end to end,
+    // and the default ("fusion") would fuse BM25 in and change the ordering.
+    vi.stubEnv("MEM0_RECALL_STRATEGY", "dense");
 
     const table: Record<string, number[]> = {
       "veeam 查询": [0.95, 0.05],
