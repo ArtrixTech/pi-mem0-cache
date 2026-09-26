@@ -49,6 +49,22 @@ describe("classify", () => {
     expect(classify("https://api.mem0.ai/v1/ping/", { method: "GET" })?.kind).toBe("read-other");
   });
 
+  it("classifies v3 single-item operations, not just v1", () => {
+    // The SDK mixes versions by operation: /v3/ for search + add, /v1/ for
+    // single-item get/update/delete. Matching only v1 sent every v3
+    // single-item call down the network path.
+    expect(classify("https://api.mem0.ai/v3/memories/abc/", { method: "GET" })?.kind).toBe("read-get");
+    expect(classify("https://api.mem0.ai/v3/memories/abc/", { method: "PUT", body: "{}" })?.kind).toBe("write-update");
+    expect(classify("https://api.mem0.ai/v3/memories/abc/", { method: "DELETE" })?.kind).toBe("write-delete");
+    expect(classify("https://api.mem0.ai/v3/memories/abc/history/", { method: "GET" })?.kind).toBe("read-history");
+  });
+
+  it("captures the query string so GET reads can be scoped", () => {
+    const c = classify("https://api.mem0.ai/v1/memories/abc/?user_id=artrix&app_id=artrix-reach", { method: "GET" });
+    expect(c?.kind).toBe("read-get");
+    expect(c?.search).toBe("?user_id=artrix&app_id=artrix-reach");
+  });
+
   it("passes through non-string bodies", () => {
     const stream = new ReadableStream();
     expect(classify(SEARCH_URL, { method: "POST", body: stream })).toBeNull();

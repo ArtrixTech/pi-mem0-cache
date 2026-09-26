@@ -1,0 +1,202 @@
+1. [uncategorized] artrix-reach: 本地领先 1 个未推 commit → 顺手 git push                                                                                                                                            
+
+ Warning: glla: this session could not own the working-directory state root (a worker contact, or an unresolved sessionDir) — it is read-only to prevent competing goal/loop writes. /glla owner   
+ inspects the holder; /glla takeover resolves it with confirmation.                                                                                                                                
+
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Update Available                                                                                                                                                                                  
+ New version 0.85.1 is available. Run pi update                                                                                                                                                    
+ Changelog: https://pi.dev/changelog                                                                                                                                                               
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Package Updates Available                                                                                                                                                                         
+ Package updates are available. Run pi update --extensions                                                                                                                                         
+ Packages:                                                                                                                                                                                         
+ - pi-web-access                                                                                                                                                                                   
+ - pi-subagents                                                                                                                                                                                    
+ - pi-lens                                                                                                                                                                                         
+ - @plannotator/pi-extension                                                                                                                                                                       
+ - @mem0/pi-agent-plugin                                                                                                                                                                           
+ - pi-compact-thinking                                                                                                                                                                             
+ - github.com/ArtrixTech/pi-mem0-cache                                                                                                                                                             
+ - @juicesharp/rpiv-todo                                                                                                                                                                           
+ - pi-goal-list-loop-audit                                                                                                                                                                         
+ - @juicesharp/rpiv-ask-user-question                                                                                                                                                              
+ - @quintinshaw/pi-dynamic-workflows                                                                                                                                                               
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+ ╭─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── artrix-reach ──╮ 
+ │ ❯                                                                                                                                                                                             │ 
+ ╰───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── glm-5.3-flash • max ─╯ 
+
+ ⎇ main │ ~/…/artrix-reach │ newapi ✗ │ 󰆼 0%                                                                                                                                            │ 0 / 1.0M
+
+^C
+➜  artrix-reach git:(main) ✗ 
+➜  artrix-reach git:(main) ✗ 
+➜  artrix-reach git:(main) ✗ 
+➜  artrix-reach git:(main) ✗ cd ../XAgent
+➜  XAgent git:(main) gpdev
+remote: Enumerating objects: 5509, done.
+remote: Counting objects: 100% (2136/2136), done.
+remote: Compressing objects: 100% (598/598), done.
+remote: Total 5509 (delta 1744), reused 1854 (delta 1534), pack-reused 3373 (from 1)
+Receiving objects: 100% (5509/5509), 10.41 MiB | 13.05 MiB/s, done.
+Resolving deltas: 100% (4134/4134), completed with 536 local objects.
+From https://github.com/olo-dot-io/OLo
+   2a4a277ac..1f4d77794  main                                        -> origin/main
+ * [new branch]          backup/local-codex/harness-runtime-parity   -> origin/backup/local-codex/harness-runtime-parity
+   0c16f3db9..172c5b455  backup/local-main                           -> origin/backup/local-main
+ * [new branch]          backup/local-runtime-rot-archive-2026-05-05 -> origin/backup/local-runtime-rot-archive-2026-05-05
+ * [new branch]          codex/harness-runtime-parity                -> origin/codex/harness-runtime-parity
+ * [new branch]          codex/windows-compatibility                 -> origin/codex/windows-compatibility
+ * [new tag]             v0.707.0                                    -> v0.707.0
+Updating 8a290f336..1f4d77794
+Fast-forward
+ .github/pull_request_template.md                                                                                           |   16 +-
+ .gitignore                                                                                                                 |    1 +
+ AGENTS.md                                                                                                                  |  134 +--
+ CHANGELOG.md                                                                                                               |   27 +-
+ CONTRIBUTING.md                                                                                                            |   78 --
+ DESIGN.md                                                                                                                  |   48 +-
+ README.md                                                                                                                  |   26 +-
+ apps/macos/OLo-Capsule/Resources/companion/ultra-sax-entry.png                                                             |  Bin 633 -> 682 bytes
+ apps/macos/OLo-Capsule/Resources/companion/ultra-sax-loop.png                                                              |  Bin 830 -> 887 bytes
+ apps/macos/OLo-Capsule/scripts/generate-companion-frames.mjs                                                               |  157 ++-
+ apps/macos/OLo-KeyMonitor/Sources/AXContextFacts.swift                                                                     |    4 +-
+ benchmarks/agent/.gitignore                                                                                                |    6 +
+ benchmarks/agent/adapters/__init__.py                                                                                      |    0
+ benchmarks/agent/adapters/aider_feedback.py                                                                                |  114 ++
+ benchmarks/agent/adapters/five_harbor.py                                                                                   |  671 ++++++++++++
+ benchmarks/agent/adapters/olo-native-harness.ts                                                                            |  129 +++
+ benchmarks/agent/adapters/provider_usage.py                                                                                |  178 ++++
+ benchmarks/agent/adapters/run-portable-harness.py                                                                          |  364 +++++++
+ benchmarks/agent/adapters/test_adapters.py                                                                                 | 1048 +++++++++++++++++++
+ benchmarks/agent/aider.py                                                                                                  |  144 +++
+ benchmarks/agent/assets/LICENSE-Noto-Sans-SC.txt                                                                           |   93 ++
+ benchmarks/agent/assets/noto-sans-sc.woff2                                                                                 |  Bin 0 -> 175304 bytes
+ benchmarks/agent/build.py                                                                                                  |   69 ++
+ benchmarks/agent/cli.py                                                                                                    |  584 +++++++++++
+ benchmarks/agent/install.py                                                                                                |  177 ++++
+ benchmarks/agent/pyproject.toml                                                                                            |   12 +
+ benchmarks/agent/report.html                                                                                               |  489 +++++++++
+ benchmarks/agent/report.py                                                                                                 |  510 +++++++++
+ benchmarks/agent/runtime.py                                                                                                |  406 ++++++++
+ benchmarks/agent/scoring.py                                                                                                |  213 ++++
+ benchmarks/agent/storage.py                                                                                                |  484 +++++++++
+ benchmarks/agent/test_cli.py                                                                                               |  828 +++++++++++++++
+ benchmarks/agent/test_runtime.py                                                                                           |  341 ++++++
+ benchmarks/agent/test_scoring.py                                                                                           |  290 ++++++
+ benchmarks/agent/test_storage.py                                                                                           |  573 ++++++++++
+ benchmarks/agent/uv.lock                                                                                                   | 1417 +++++++++++++++++++++++++
+ benchmarks/agent/versions.py                                                                                               |   83 ++
+ benchmarks/voice/README.md                                                                                                 |   46 -
+ cli/commands/config.test.ts                                                                                                |    8 +-
+ cli/deps.ts                                                                                                                |   55 +-
+ docs/agent-runtime.md                                                                                                      |  117 ---
+ docs/architecture.md                                                                                                       |   63 --
+ docs/branding.md                                                                                                           |   42 -
+ "docs/decisions/0002-Agent-Context-Epoch-\344\270\216\346\250\241\345\236\213\350\257\267\346\261\202\351\235\242.md"      |  134 ---
+ ...-Agent-\345\247\224\346\264\276\344\270\216\346\211\247\350\241\214\347\224\237\345\221\275\345\221\250\346\234\237.md" |   69 --
+ "docs/decisions/0004-\347\273\237\344\270\200-agent-\350\265\204\346\272\220\345\274\225\347\224\250.md"                   |   90 --
+ ...260\270\344\271\205\345\210\240\351\231\244\344\270\216\350\267\250\345\255\230\345\202\250\346\270\205\347\220\206.md" |   93 --
+ docs/development.md                                                                                                        |  233 ++---
+ docs/ipc-channels.md                                                                                                       |    3 +-
+ e2e/__snapshots__/agent-genui-visual.e2e.test.ts-snapshots/genui-inline-chips-dark-darwin.png                              |  Bin 7889 -> 6889 bytes
+ e2e/__snapshots__/agent-genui-visual.e2e.test.ts-snapshots/genui-inline-chips-light-darwin.png                             |  Bin 8614 -> 8401 bytes
+ e2e/__snapshots__/agent-genui-visual.e2e.test.ts-snapshots/genui-pending-choice-dark-darwin.png                            |  Bin 24612 -> 22448 bytes
+ e2e/__snapshots__/agent-genui-visual.e2e.test.ts-snapshots/genui-pending-choice-light-darwin.png                           |  Bin 27840 -> 25838 bytes
+ e2e/__snapshots__/agent-rich-rendering.e2e.test.ts-snapshots/agent-command-card-1200-darwin.png                            |  Bin 0 -> 12504 bytes
+ e2e/__snapshots__/agent-rich-rendering.e2e.test.ts-snapshots/agent-command-card-640-darwin.png                             |  Bin 0 -> 12126 bytes
+ e2e/__snapshots__/agent-rich-rendering.e2e.test.ts-snapshots/agent-command-card-dark-darwin.png                            |  Bin 0 -> 10696 bytes
+ e2e/__snapshots__/agent-rich-rendering.e2e.test.ts-snapshots/agent-command-pending-darwin.png                              |  Bin 0 -> 8589 bytes
+ e2e/__snapshots__/agent-rich-rendering.e2e.test.ts-snapshots/agent-reasoning-disclosure-expanded-darwin.png                |  Bin 6287 -> 0 bytes
+ e2e/__snapshots__/agent-rich-rendering.e2e.test.ts-snapshots/agent-rich-rendering-answer-darwin.png                        |  Bin 30393 -> 74798 bytes
+ e2e/__snapshots__/agent-workbar.e2e.test.ts-snapshots/agent-file-browser-darwin.png                                        |  Bin 0 -> 49796 bytes
+ e2e/__snapshots__/agent-workbar.e2e.test.ts-snapshots/agent-file-completed-darwin.png                                      |  Bin 0 -> 45900 bytes
+ e2e/__snapshots__/agent-workbar.e2e.test.ts-snapshots/agent-file-preview-darwin.png                                        |  Bin 0 -> 56483 bytes
+ e2e/__snapshots__/agent-workbar.e2e.test.ts-snapshots/agent-inspector-subagent-details-darwin.png                          |  Bin 125107 -> 77646 bytes
+ e2e/__snapshots__/agent-workbar.e2e.test.ts-snapshots/agent-subagents-clean-list-darwin.png                                |  Bin 0 -> 6316 bytes
+ e2e/__snapshots__/agent-workbar.e2e.test.ts-snapshots/agent-workbench-launcher-maximized-darwin.png                        |  Bin 46901 -> 52513 bytes
+ e2e/__snapshots__/agent-workbar.e2e.test.ts-snapshots/agent-workbench-side-chat-640x480-darwin.png                         |  Bin 38042 -> 33112 bytes
+ e2e/__snapshots__/agent-workbar.e2e.test.ts-snapshots/workspace-dividers-dark-darwin.png                                   |  Bin 0 -> 61918 bytes
+ e2e/__snapshots__/agent-workbar.e2e.test.ts-snapshots/workspace-dividers-dark-hover-darwin.png                             |  Bin 0 -> 61740 bytes
+ e2e/__snapshots__/agent-workbar.e2e.test.ts-snapshots/workspace-dividers-light-darwin.png                                  |  Bin 0 -> 66515 bytes
+ e2e/__snapshots__/agent-workbar.e2e.test.ts-snapshots/workspace-dividers-light-hover-darwin.png                            |  Bin 0 -> 66784 bytes
+ e2e/__snapshots__/extensions-marketplace.e2e.test.ts-snapshots/extension-marketplace-plugins-populated-dark-darwin.png     |  Bin 60111 -> 59900 bytes
+ e2e/__snapshots__/extensions-marketplace.e2e.test.ts-snapshots/extension-marketplace-plugins-populated-darwin.png          |  Bin 67403 -> 65710 bytes
+ e2e/__snapshots__/extensions-marketplace.e2e.test.ts-snapshots/extension-marketplace-skills-populated-dark-darwin.png      |  Bin 84871 -> 83138 bytes
+ e2e/__snapshots__/extensions-marketplace.e2e.test.ts-snapshots/extension-marketplace-skills-populated-darwin.png           |  Bin 96902 -> 94485 bytes
+ e2e/__snapshots__/history.e2e.test.ts-snapshots/flash-original-expanded-darwin.png                                         |  Bin 12947 -> 13244 bytes
+ e2e/__snapshots__/history.e2e.test.ts-snapshots/flash-populated-darwin.png                                                 |  Bin 29261 -> 29730 bytes
+ e2e/__snapshots__/history.e2e.test.ts-snapshots/history-ask-olo-action-hover-darwin.png                                    |  Bin 1234 -> 1334 bytes
+ e2e/__snapshots__/history.e2e.test.ts-snapshots/history-filter-open-darwin.png                                             |  Bin 57388 -> 56011 bytes
+ e2e/__snapshots__/history.e2e.test.ts-snapshots/history-original-expanded-darwin.png                                       |  Bin 12644 -> 12935 bytes
+ e2e/__snapshots__/history.e2e.test.ts-snapshots/history-populated-darwin.png                                               |  Bin 38579 -> 39042 bytes
+ e2e/__snapshots__/visual-regression.e2e.test.ts-snapshots/agent-home-ultra-selected-dark-darwin.png                        |  Bin 62214 -> 0 bytes
+ e2e/__snapshots__/visual-regression.e2e.test.ts-snapshots/agent-home-ultra-selected-light-darwin.png                       |  Bin 68308 -> 0 bytes
+ e2e/__snapshots__/visual-regression.e2e.test.ts-snapshots/agent-model-ultra-selected-dark-darwin.png                       |  Bin 0 -> 14996 bytes
+ e2e/__snapshots__/visual-regression.e2e.test.ts-snapshots/agent-model-ultra-selected-light-darwin.png                      |  Bin 0 -> 15394 bytes
+ e2e/__snapshots__/visual-regression.e2e.test.ts-snapshots/device-dark-darwin.png                                           |  Bin 85034 -> 58844 bytes
+ e2e/__snapshots__/visual-regression.e2e.test.ts-snapshots/device-light-darwin.png                                          |  Bin 89162 -> 62767 bytes
+ e2e/__snapshots__/visual-regression.e2e.test.ts-snapshots/settings-account-agent-dark-darwin.png                           |  Bin 47102 -> 45880 bytes
+ e2e/__snapshots__/visual-regression.e2e.test.ts-snapshots/settings-account-agent-light-darwin.png                          |  Bin 50293 -> 49398 bytes
+ e2e/__snapshots__/visual-regression.e2e.test.ts-snapshots/settings-account-agent-share-private-dark-darwin.png             |  Bin 43044 -> 43153 bytes
+ e2e/__snapshots__/visual-regression.e2e.test.ts-snapshots/settings-account-agent-share-private-light-darwin.png            |  Bin 45545 -> 46079 bytes
+ e2e/__snapshots__/visual-regression.e2e.test.ts-snapshots/settings-account-authenticated-dark-darwin.png                   |  Bin 46046 -> 44478 bytes
+ e2e/__snapshots__/visual-regression.e2e.test.ts-snapshots/settings-account-authenticated-light-darwin.png                  |  Bin 49035 -> 47653 bytes
+ e2e/__snapshots__/visual-regression.e2e.test.ts-snapshots/settings-account-share-dark-darwin.png                           |  Bin 44743 -> 44618 bytes
+ e2e/__snapshots__/visual-regression.e2e.test.ts-snapshots/settings-account-share-light-darwin.png                          |  Bin 47038 -> 47484 bytes
+ e2e/__snapshots__/visual-regression.e2e.test.ts-snapshots/settings-appearance-dark-darwin.png                              |  Bin 61798 -> 62371 bytes
+ e2e/__snapshots__/visual-regression.e2e.test.ts-snapshots/settings-appearance-light-darwin.png                             |  Bin 66477 -> 66961 bytes
+ e2e/__snapshots__/visual-regression.e2e.test.ts-snapshots/settings-assistant-dark-darwin.png                               |  Bin 93398 -> 90847 bytes
+ e2e/__snapshots__/visual-regression.e2e.test.ts-snapshots/settings-assistant-light-darwin.png                              |  Bin 104407 -> 100984 bytes
+ e2e/__snapshots__/visual-regression.e2e.test.ts-snapshots/settings-auto-replace-dark-darwin.png                            |  Bin 67522 -> 67226 bytes
+ e2e/__snapshots__/visual-regression.e2e.test.ts-snapshots/settings-auto-replace-light-darwin.png                           |  Bin 73505 -> 73505 bytes
+ e2e/__snapshots__/visual-regression.e2e.test.ts-snapshots/settings-data-privacy-dark-darwin.png                            |  Bin 87610 -> 86986 bytes
+ e2e/__snapshots__/visual-regression.e2e.test.ts-snapshots/settings-data-privacy-light-darwin.png                           |  Bin 96203 -> 94594 bytes
+ e2e/__snapshots__/visual-regression.e2e.test.ts-snapshots/settings-extensions-dark-darwin.png                              |  Bin 55466 -> 53134 bytes
+ e2e/__snapshots__/visual-regression.e2e.test.ts-snapshots/settings-extensions-light-darwin.png                             |  Bin 60203 -> 57642 bytes
+ e2e/__snapshots__/visual-regression.e2e.test.ts-snapshots/settings-external-agents-dark-darwin.png                         |  Bin 57478 -> 68253 bytes
+ e2e/__snapshots__/visual-regression.e2e.test.ts-snapshots/settings-external-agents-light-darwin.png                        |  Bin 62981 -> 75958 bytes
+ e2e/__snapshots__/visual-regression.e2e.test.ts-snapshots/settings-language-combobox-open-zh-cn-dark-darwin.png            |  Bin 68081 -> 64870 bytes
+ e2e/__snapshots__/visual-regression.e2e.test.ts-snapshots/settings-language-combobox-open-zh-cn-light-darwin.png           |  Bin 72580 -> 69110 bytes
+ e2e/__snapshots__/visual-regression.e2e.test.ts-snapshots/settings-memory-dark-darwin.png                                  |  Bin 71041 -> 70345 bytes
+ e2e/__snapshots__/visual-regression.e2e.test.ts-snapshots/settings-memory-light-darwin.png                                 |  Bin 79013 -> 77679 bytes
+ e2e/__snapshots__/visual-regression.e2e.test.ts-snapshots/settings-output-dark-darwin.png                                  |  Bin 57271 -> 56816 bytes
+ e2e/__snapshots__/visual-regression.e2e.test.ts-snapshots/settings-output-light-darwin.png                                 |  Bin 62874 -> 61691 bytes
+ e2e/__snapshots__/visual-regression.e2e.test.ts-snapshots/settings-output-punctuation-select-open-zh-cn-dark-darwin.png    |  Bin 62188 -> 62143 bytes
+ e2e/__snapshots__/visual-regression.e2e.test.ts-snapshots/settings-output-punctuation-select-open-zh-cn-light-darwin.png   |  Bin 68382 -> 67584 bytes
+ e2e/__snapshots__/visual-regression.e2e.test.ts-snapshots/settings-output-select-open-zh-cn-dark-darwin.png                |  Bin 75171 -> 72965 bytes
+ e2e/__snapshots__/visual-regression.e2e.test.ts-snapshots/settings-output-select-open-zh-cn-light-darwin.png               |  Bin 82544 -> 81315 bytes
+ e2e/__snapshots__/visual-regression.e2e.test.ts-snapshots/settings-recording-dark-darwin.png                               |  Bin 72107 -> 70291 bytes
+ e2e/__snapshots__/visual-regression.e2e.test.ts-snapshots/settings-recording-light-darwin.png                              |  Bin 78733 -> 75985 bytes
+ e2e/__snapshots__/visual-regression.e2e.test.ts-snapshots/settings-speech-recognition-dark-darwin.png                      |  Bin 58903 -> 58868 bytes
+ e2e/__snapshots__/visual-regression.e2e.test.ts-snapshots/settings-speech-recognition-light-darwin.png                     |  Bin 64524 -> 64256 bytes
+ e2e/__snapshots__/visual-regression.e2e.test.ts-snapshots/sidebar-account-authenticated-dark-darwin.png                    |  Bin 3022 -> 3274 bytes
+ e2e/__snapshots__/visual-regression.e2e.test.ts-snapshots/sidebar-account-authenticated-light-darwin.png                   |  Bin 3297 -> 3608 bytes
+ e2e/__snapshots__/visual-regression.e2e.test.ts-snapshots/sidebar-account-menu-open-zh-cn-dark-darwin.png                  |  Bin 54017 -> 0 bytes
+ e2e/__snapshots__/visual-regression.e2e.test.ts-snapshots/sidebar-account-menu-open-zh-cn-light-darwin.png                 |  Bin 60636 -> 0 bytes
+ e2e/__snapshots__/visual-regression.e2e.test.ts-snapshots/sidebar-account-panel-zh-cn-dark-darwin.png                      |  Bin 0 -> 7625 bytes
+ e2e/__snapshots__/visual-regression.e2e.test.ts-snapshots/sidebar-account-panel-zh-cn-light-darwin.png                     |  Bin 0 -> 8708 bytes
+ e2e/agent-approval.e2e.test.ts                                                                                             |  135 ++-
+ e2e/agent-artifact-review.e2e.test.ts                                                                                      |   25 +-
+ e2e/agent-attachment-preview.e2e.test.ts                                                                                   |   14 +
+ e2e/agent-composer-dictation-probe.e2e.test.ts                                                                             |   25 +-
+ e2e/agent-conversation-control.e2e.test.ts                                                                                 |  439 +++++++-
+ e2e/agent-conversation-scroll.e2e.test.ts                                                                                  |   17 +
+ e2e/agent-delegation.e2e.test.ts                                                                                           |  609 ++++++++++-
+ e2e/agent-external-agent-bridge.e2e.test.ts                                                                                |   20 +-
+ e2e/agent-foundation-behavior.e2e.test.ts                                                                                  |   95 +-
+ e2e/agent-intent-home.e2e.test.ts                                                                                          |  201 +++-
+ e2e/agent-local-action-harness.e2e.test.ts                                                                                 |    1 +
+ e2e/agent-managed-capabilities.e2e.test.ts                                                                                 |    2 +-
+ e2e/agent-onboarding.e2e.test.ts                                                                                           |   18 +-
+ e2e/agent-project-memory.e2e.test.ts                                                                                       |   25 +
+ e2e/agent-public-share.e2e.test.ts                                                                                         |    6 +
+ e2e/agent-realistic-network-behavior.e2e.test.ts                                                                           |    9 +
+ e2e/agent-rich-rendering.e2e.test.ts                                                                                       |  451 +++++++-
+ e2e/agent-session-history.e2e.test.ts                                                                                      |  100 +-
+
+[Output truncated: showing 200 of 2078 lines]

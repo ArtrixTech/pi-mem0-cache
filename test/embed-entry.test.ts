@@ -43,6 +43,10 @@ describe("extension entry embedding wiring", () => {
     vi.stubEnv("MEM0_CACHE_SHADOW_PATH", join(tmp, `shadow-${run}.jsonl`));
     vi.stubEnv("MEM0_VECTORS_PATH", join(tmp, `vectors-${run}.json`));
     vi.stubEnv("JINA_API_KEY", "sk-entry-test");
+    // Pin the provider to jina: this test mocks the jina embeddings endpoint and
+    // covers that wiring end to end. Default provider order now tries
+    // OpenRouter first, which would leave the mocked URL untouched.
+    vi.stubEnv("MEM0_EMBED_PROVIDER", "jina");
     // Pin the dense strategy: this test covers the embedding wiring end to end,
     // and the default ("fusion") would fuse BM25 in and change the ordering.
     vi.stubEnv("MEM0_RECALL_STRATEGY", "dense");
@@ -131,8 +135,11 @@ describe("extension entry embedding wiring", () => {
     vi.stubEnv("MEM0_VECTORS_PATH", join(tmp, `vectors-${run}.json`));
     vi.stubEnv("MEM0_CONFIG_PATH", join(tmp, "no-config.json")); // isolate from the real key on this machine
     // No JINA_API_KEY: blank the real env var too, otherwise the env branch of
-    // createDefaultEmbedder() wins and the layer stays enabled.
+    // createDefaultEmbedder() wins and the layer stays enabled. Blanking the env
+    // var is not enough on its own now that keys can also come from the macOS
+    // keychain, so keychain reads are disabled for this test as well.
     vi.stubEnv("JINA_API_KEY", "");
+    vi.stubEnv("MEM0_KEYCHAIN", "0");
     globalThis.fetch = (async () => {
       throw new Error("must not touch the network");
     }) as typeof fetch;

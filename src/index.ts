@@ -30,6 +30,7 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, statSy
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { LexicalChannel, recall, type ChannelHit, type ChannelStatus, type FusedHit, type RecallChannel } from "./recall/fusion.js";
+import { extractScope, filterByScope, matchesScope, type ScopeFilters } from "./recall/scope.js";
 
 const DEFAULT_STORE_PATH = join(homedir(), ".pi", "agent", "mem0-cache.json");
 const DEFAULT_TTL_MS = 24 * 60 * 60 * 1000;
@@ -206,6 +207,10 @@ interface ClassifiedRequest {
   kind: "read-search" | "read-getall" | "read-get" | "read-history" | "read-other" | "write-add" | "write-update" | "write-delete" | "write-delete-all" | "write-other" | "other";
   memoryId?: string;
   query?: string;
+  /** Query string of the original request. The SDK's single-item GETs scope
+   *  through `?user_id=…` rather than a body, and a GET cannot carry a body
+   *  under fetch, so this is the only scope carrier those reads have. */
+  search?: string;
 }
 
 export function isMem0Host(url: URL): boolean {
@@ -229,8 +234,12 @@ export function classify(input: FetchInput, init?: RequestInit): ClassifiedReque
   if (rawBody !== undefined && bodyText === undefined) return null;
 
   const path = url.pathname;
-  const memoryIdMatch = path.match(/^\/v1\/memories\/([^/]+)\/?$/);
-  const historyMatch = path.match(/^\/v1\/memories\/([^/]+)\/history\/?$/);
+  const search = url.search;
+  // The SDK mixes versions by operation: /v3/ for search + add, /v1/ for
+  // single-item get/update/delete and history. Matching only v1 here silently
+  // sent every v3 single-item operation to the network path.
+  const memoryIdMatch = path.match(/^\/v[13]\/memories\/([^/]+)\/?$/);
+  const historyMatch = path.match(/^\/v[13]\/memories\/([^/]+)\/history\/?$/);
 
   let parsedBody: Record<string, unknown> | undefined;
   if (bodyText) {
@@ -242,25 +251,25 @@ export function classify(input: FetchInput, init?: RequestInit): ClassifiedReque
   }
 
   if (method === "GET" && historyMatch) {
-    return { url, method, bodyText, kind: "read-history", memoryId: historyMatch[1] };
+    return { url, method, bodyText, search, kind: "read-history", memoryId: historyMatch[1] };
   }
   if (method === "POST" && /^\/v[23]\/memories\/search\/?$/.test(path)) {
-    return { url, method, bodyText, kind: "read-search", query: typeof parsedBody?.query === "string" ? parsedBody.query : undefined };
+    return { url, method, bodyText, search, kind: "read-search", query: typeof parsedBody?.query === "string" ? parsedBody.query : undefined };
   }
   if (method === "POST" && /^\/v3\/memories\/add\/?$/.test(path)) {
-    return { url, method, bodyText, kind: "write-add" };
+    return { url, method, bodyText, search, kind: "write-add" };
   }
   if (method === "POST" && /^\/v3\/memories\/?$/.test(path)) {
-    return { url, method, bodyText, kind: "read-getall" };
+    return { url, method, bodyText, search, kind: "read-getall" };
   }
   if (method === "GET" && memoryIdMatch) {
-    return { url, method, bodyText, kind: "read-get", memoryId: memoryIdMatch[1] };
+    return { url, method, bodyText, search, kind: "read-get", memoryId: memoryIdMatch[1] };
   }
   if ((method === "PUT" || method === "PATCH") && memoryIdMatch) {
-    return { url, method, bodyText, kind: "write-update", memoryId: memoryIdMatch[1] };
+    return { url, method, bodyText, search, kind: "write-update", memoryId: memoryIdMatch[1] };
   }
   if (method === "DELETE" && memoryIdMatch) {
-    return { url, method, bodyText, kind: "write-delete", memoryId: memoryIdMatch[1] };
+    return { url, method, bodyText, search, kind: "write-delete", memoryId: memoryIdMatch[1] };
   }
   if (method === "DELETE" && /^\/v1\/memories\/?$/.test(path)) {
     return { url, method, bodyText, kind: "write-delete-all" };
@@ -387,8 +396,12 @@ function materialize(store: Store, ids: string[], limit: number): LocalMemory[] 
   return out;
 }
 
-/**
- * Rank the mirror for one query under the configured strategy.
+/** Rank the mirror for one query under the configured strategy.
+ *
+ * Scope filtering happens on the corpus *before* ranking, not on the result:
+ * out-of-scope memories must never enter channel candidate pools, or the
+ * reranker and the shadow log would both see data the request is not entitled
+ * to. A tombstoned memory is dropped at the same point.
  *
  * Strategy resolution happens per call so a test-mode switch takes effect on the
  * next read rather than at session start. Every strategy is answerable: "dense"
@@ -403,6 +416,7 @@ export async function rankLocal(
     embed?: EmbedHarness;
     localStrategy?: LocalStrategy;
     reranker?: Reranker;
+    scope?: ScopeFilters;
     onStrategy?: (info: { strategy: LocalStrategy; degraded?: string; channels: ChannelStatus[] }) => void;
   } = {},
   limit = MAX_FALLBACK_RESULTS,
@@ -412,14 +426,18 @@ export async function rankLocal(
   const notes: ChannelStatus[] = [];
 
   if (requested === "legacy") {
-    return searchLocal(store, query, limit);
+    return filterByScope(searchLocal(store, query, limit), opts.scope) as LocalMemory[];
   }
 
+  // Scope the corpus once, then rank within it.
+  const scoped = Object.values(store.memories).filter((m) => !m.deleted && matchesScope(m, opts.scope));
+  const docs = scoped.map((m) => ({ id: m.id, text: m.memory }));
+
   if (requested !== "dense") {
-    channels.push(new LexicalChannel({ docs: liveDocs(store) }));
+    channels.push(new LexicalChannel({ docs }));
   }
   if (requested !== "bm25" && opts.embed) {
-    channels.push(new EmbedHarnessChannel(opts.embed));
+    channels.push(new EmbedHarnessChannel(opts.embed, scoped));
   }
 
   let degraded: string | undefined;
@@ -427,7 +445,7 @@ export async function rankLocal(
     // "dense" requested but nothing to serve it: fall back to lexical rather
     // than answering nothing.
     degraded = `no channel for strategy "${requested}"`;
-    channels.push(new LexicalChannel({ docs: liveDocs(store) }));
+    channels.push(new LexicalChannel({ docs }));
   }
 
   const reranker =
@@ -452,14 +470,22 @@ export async function rankLocal(
   return materialize(store, ids, limit);
 }
 
-/** Adapts the embedding harness' search to the channel interface. */
+/** Adapts the embedding harness' search to the channel interface.
+ *
+ * The harness ranks the whole mirror, so its result is intersected with the
+ * scoped id set here — the harness predates scope filtering and is not trusted
+ * to respect it. */
 class EmbedHarnessChannel implements RecallChannel {
   readonly name = "dense";
-  constructor(private embed: EmbedHarness) {}
+  constructor(
+    private embed: EmbedHarness,
+    private allowed?: LocalMemory[],
+  ) {}
   async search(query: string): Promise<ChannelHit[]> {
     const hits = await this.embed.search(query);
     if (!hits) throw new Error(this.embed.status().lastError ?? "embedding layer unavailable");
-    return hits.map((h) => ({ id: h.m.id, score: h.score }));
+    const allowed = this.allowed ? new Set(this.allowed.map((m) => m.id)) : undefined;
+    return hits.filter((h) => !allowed || allowed.has(h.m.id)).map((h) => ({ id: h.m.id, score: h.score }));
   }
 }
 
@@ -793,6 +819,13 @@ async function recordShadow(
 ): Promise<void> {
   const remote = remoteSearchHits(remoteBody);
   const query = req.query ?? "";
+  // Log under the request's own scope: the shadow log must measure what this
+  // read was entitled to see, not what a scope-free corpus would have returned.
+  const scope = extractScope(req.bodyText, req.search);
+  const scopedDocs = (): { id: string; text: string }[] =>
+    Object.values(store.memories)
+      .filter((m) => !m.deleted && matchesScope(m, scope))
+      .map((m) => ({ id: m.id, text: m.memory }));
   const local = searchLocalScored(store, query, 10).map(({ m, score }) => ({ id: m.id, score }));
   const { overlap5, overlap10, mrr } = compareShadow(local, remote);
   const entry: ShadowEntry = {
@@ -808,7 +841,7 @@ async function recordShadow(
 
   // BM25 ranking — the new lexical floor, logged on the same entry so the
   // legacy-vs-BM25 comparison comes from live traffic rather than a replay.
-  const lexicalChannel = new LexicalChannel({ docs: liveDocs(store) });
+  const lexicalChannel = new LexicalChannel({ docs: scopedDocs() });
   const bm25Hits = lexicalChannel.search(query, 10) as ChannelHit[];
   const bm25Ids = bm25Hits.map((h) => h.id);
   if (bm25Ids.length > 0) {
@@ -829,7 +862,7 @@ async function recordShadow(
     try {
       const result = await recall({
         query,
-        channels: [new LexicalChannel({ docs: liveDocs(store) }), new EmbedHarnessChannel(embed)],
+        channels: [new LexicalChannel({ docs: scopedDocs() }), new EmbedHarnessChannel(embed, Object.values(store.memories).filter((m) => !m.deleted && matchesScope(m, scope)))],
         perChannelLimit: 50,
         fusedLimit: 10,
       });
@@ -1309,6 +1342,7 @@ export function createInterceptor(
           embed: opts.embed,
           localStrategy: opts.localStrategy,
           reranker: opts.reranker,
+          scope: extractScope(req.bodyText, req.search),
           onStrategy: (info) => {
             store.stats.lastStrategy = info.strategy;
             if (info.degraded) {
@@ -1325,12 +1359,18 @@ export function createInterceptor(
       return jsonResponse({ results: ranked.map(stripInternal) });
     }
     if (req.kind === "read-getall") {
-      const all = Object.values(store.memories).filter((m) => !m.deleted).map(stripInternal);
+      // Scope-filtered: a project-scoped getAll must not return another
+      // project's memories. See src/recall/scope.ts for the filtering rule.
+      const scope = extractScope(req.bodyText, req.search);
+      const all = Object.values(store.memories)
+        .filter((m) => !m.deleted && matchesScope(m, scope))
+        .map(stripInternal);
       return jsonResponse({ results: all, count: all.length });
     }
     if (req.kind === "read-get" && req.memoryId) {
+      const scope = extractScope(req.bodyText, req.search);
       const m = store.memories[req.memoryId];
-      if (m && !m.deleted) return jsonResponse(stripInternal(m));
+      if (m && !m.deleted && matchesScope(m, scope)) return jsonResponse(stripInternal(m));
     }
     return null;
   };
@@ -1737,6 +1777,11 @@ export const KEYCHAIN_SERVICES: Record<string, string> = {
  * the platform has no keychain, so every caller keeps an env fallback.
  */
 export function readKeyFromKeychain(service: string): string | undefined {
+  // Tests must be able to run without reading the machine's real credentials:
+  // a developer with a live key in the keychain would otherwise get a different
+  // code path than CI. Set MEM0_KEYCHAIN=0 to disable all keychain reads.
+  if (process.env.MEM0_KEYCHAIN === "0") return undefined;
+  if (!service) return undefined;
   try {
     const out = execFileSync("security", ["find-generic-password", "-s", service, "-w"], {
       encoding: "utf8",

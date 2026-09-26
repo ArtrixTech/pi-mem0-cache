@@ -1,0 +1,112 @@
+Executed 3 commands (91 lines, 53.7KB). Indexed 5 sections. Searched 3 queries.
+
+## Commands
+
+- find error string in pi source: `grep -rn "Turn prefix summarization failed" /Users/artrix/.npm-global/lib/node_modules/@earendil-works/pi-coding-agent/dist 2>/dev/null | head -20`
+- docs mention of compaction settings: `grep -rn -i "compaction" /Users/artrix/.npm-global/lib/node_modules/@earendil-works/pi-coding-agent/docs/*.md | head -40`
+- pi docs list: `ls /Users/artrix/.npm-global/lib/node_modules/@earendil-works/pi-coding-agent/docs/`
+
+## Indexed Sections
+
+- find error string in pi source (1) (0.2KB)
+- find error string in pi source (2) (43.1KB)
+- docs mention of compaction settings (1) (0.2KB)
+- docs mention of compaction settings (2) (9.7KB)
+- pi docs list (0.5KB)
+
+## Turn prefix summarization failed token cap
+
+### find error string in pi source (2)
+/Users/artrix/.npm-global/lib/node_modules/@earendil-works/pi-coding-agent/dist/bundle/chunks/chunk-4DKZACXI.js:818:${TURN_PREFIX_SUMMARIZATION_PROMPT}`}],timestamp:Date.now()}],completionOptions=model.reasoning&&thinkingLevel&&thinkingLevel!=="off"?{maxTokens,reasoning:thinkingLevel}:{maxTokens},response=await request({systemPrompt:SUMMARIZATION_SYSTEM_PROMPT,messages:summarizationMessages},createSummaryRequestOptions(completionOptions,context),context);return response.stopReason==="aborted"?err(new CompactionError("aborted",response.errorMessage||"Turn prefix summarization aborted")):response.stopReason==="error"?err(new CompactionError("summarization_failed",`Turn prefix summarization failed: ${response.errorMessage||"Unknown error"}`)):ok({text:contentText(response.content),usage:response.usage})}var DEFAULT_RETRY_POLICY={enabled:!0,maxRetries:3,baseDelayMs:1e3,maxAgentDelayMs:DEFAULT_MAX_AGENT_RETRY_DELAY_MS};function validateToolNames(tools){let names2=new Set;for(let tool of …
+
+…try policy values must be finite non-negative safe integers")}function validateCompactionSettings(settings2){if(!Number.isSafeInteger(settings2.reserveTokens)||settings2.reserveTokens<0||!Number.isSafeInteger(settings2.keepRecentTokens)||settings2.keepRecentTokens<0)throw new RangeError("Compaction token counts must be finite non-negative safe integers")}var HarnessEventBus=class{listeners=new Map;watchListeners=new Set;deliveryTail=Promise.resolve();closedError;on(type,listener){if(this.closedError!==void 0)throw this.closedError;let wrapped=(event,context)=>listener(event,context),listeners=…
+
+…lity:"high",description:"Provider response id"},"pi.ai.response.stop_reason":{type:"string",values:["stop","length","tool_use","error","aborted","deferred"],description:"Normalized terminal response reason"},"pi.ai.http.status_code":{type:"number",description:"Final HTTP status"},"pi.ai.usage.input_tokens":{type:"number",description:"Reported input tokens"},"pi.ai.usage.output_tokens":{type:"number",description:"Reported output tokens"},"pi.ai.usage.cache_read_tokens":{type:"number",description:"Reported cache-read tokens"},"pi.ai.usage.cache_write_tokens":{type:"number",description:"Reported cache-write tokens"},"pi.ai.usage.reasoning_tokens":{type:"number",description:"Reported reasoning tokens"},"pi.ai.usage.total_tokens":{type:"number",description:"Reported total tokens"},"pi.ai.usage.cost":{type:"number",description:"Reported total cost"},"pi.ai.stream.chunk_count":{type:"number",description:"Streamed update chunk count"},"pi.ai.stream.time_to_first_chunk_ms":{type:"number",description:"Elapsed milliseconds to first update chunk"},"pi.ai.error.type":{type:"…
+
+…OOK_NAMES=["before_run","before_drive","before_run_end","transform_context","before_request","before_payload","after_response","before_tool","after_tool","before_compaction","before_navigation"],EVENT_TYPES=["run_start","run_resume","run_suspend","operation_abort","run_end","fault","handler_error","turn_start","turn_end","r…
+
+### find error string in pi source (1)
+# find error string in pi source
+
+$ grep -rn "Turn prefix summarization failed" /Users/artrix/.npm-global/lib/node_modules/@earendil-works/pi-coding-agent/dist 2>/dev/null | head -20
+
+### docs mention of compaction settings (2)
+/Users/artrix/.npm-global/lib/node_modules/@earendil-works/pi-coding-agent/docs/compaction.md:1:# Compaction & Branch Summarization
+/Users/artrix/.npm-global/lib/node_modules/@earendil-works/pi-coding-agent/docs/compaction.md:3:LLMs have limited context windows. When conversations grow too long, Pi uses compaction to summarize older content while preserving recent work. This page covers both auto-compaction and branch summarization.
+/Users/artrix/.npm-global/lib/node_modules/@earendil-works/pi-coding-agent/docs/compaction.md:6:- [`packages/coding-agent/src/core/compaction/compaction.ts`](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/compaction/compaction.ts) - Auto-compaction logic
+/Users/artrix/.npm-global/lib/node_modules/@earendil-works/pi-coding-agent/docs/compaction.md:7:- [`packages/coding-agent/src/core/compaction/branch-summarization.ts`](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/compaction/branch-summarization.ts) - Branch summarization
+/Users/artrix/.npm-global/lib/node_modules/@earendil-works/pi-coding-agent/docs/compaction.md:8:- [`packages/coding-agent/src/core/compaction/utils.ts`](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/compaction/utils.ts) - Shared utilities (file tracking,…
+
+…ithub.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/session-manager.ts) - Entry types (`CompactionEntry`, `BranchSummaryEntry`)
+/Users/artrix/.npm-global/lib/node_modules/@earendil-works/pi-coding-agent/docs/compaction.md:20:| Compaction | Context exceeds threshold, or `/compact` | Summarize old messages to free up context |
+/Users/artrix/.npm-global/lib/node_modules/@earendil-works/pi-coding-agent/docs/compaction.md:23:Both use the same structured summary format and track file operations cumulatively. Compaction and branch-summary requests use fresh routing session IDs and, w…
+
+…s/compaction.md:52:Before compaction:
+/Users/artrix/.npm-global/lib/node_modules/@earendil-works/pi-coding-agent/docs/compaction.md:63:After compaction (new entry appended):
+/Users/artrix/.npm-global/lib/node_modules/@earendil-works/pi-coding-agent/docs/compaction.md:83:On repeated compactions, the summarized span starts at the previous compaction's kept boundary (`firstKeptEntryId`), not at the compaction entry itself, falling back to the entry after the previous compaction if that kept entry cannot be found in the path. A retain-none compaction records its own ID as `firstKeptEntryId`; repeated compaction starts after that entry. This preserves messages that survived the earlier compaction by including them in the next summarization pass as well. Pi also recalculates `tokensBefore` from the rebuilt, context-edited session projection before writing the new `CompactionEntry`, so the token count reflects the actual pre-compaction context being replaced. Omitted raw entries remain stored but do not affect cut selection, summaries, checkpoints, or token estimates.
+/Users/a…
+
+## compaction settings max output tokens
+
+### find error string in pi source (2)
+…stopReason==="error"?err(new CompactionError("summarization_failed",`Turn prefix summarization failed: ${response.errorMessage||"Unknown error"}`)):ok({text:contentText(response.content),usage:response.usage})}var DEFAULT_RETRY_POLICY={enabled:!0,maxRetries:3,baseDelayMs:1e3,maxAgentDelayMs:DEFAULT_MAX_AGENT_RETRY_DELAY_MS};function validateToolNames(tools){let names2=new Set;for(let tool of tools){if(names2.has(tool.name))throw new TypeError(`Duplicate tool name: ${JSON.stringify(tool.name)}`);names2.add(tool.name)}}function validateRetryPolicy(policy){if(!Number.isSafeInteger(policy.maxRetries)||policy.maxRetries<0||policy.maxRetries===Number.MAX_SAFE_INTEGER||!Number.isSafeInteger(policy.baseDelayMs)||policy.baseDelayMs<0||policy.maxAgentDelayMs!==void 0&&(!Number.isSafeInteger(policy.maxAgentDelayMs)||policy.maxAgentDelayMs<0))throw new RangeError("Retry policy values must be finite non-negative safe integers")}function validateCompactionSettings(settings2){if(!Number.isSafeInteger(settings2.reserveTokens)||settings2.reserveTokens<0||!Number.isSafeInteger(settings2.keepRecentTokens)||settings2.keepRecentTokens<0)throw new RangeError("Compaction token counts must be finite non-negative safe integers")}var HarnessEventBus=class{listeners=new Map;watchListeners=new Set;deliveryTail=Promise.resolve();closedError;on(type,listener){if(this.closedError!==void 0)throw this.closedError;let wrapped=(event,context)=>listener(event,context),listeners=this.listeners.get(type);return listeners===void 0&&(listeners=new Set,this.listeners.set(type,listeners)),listeners.add(wrapped),()=>listeners?.delete(wrapped)}emit(event,context){return this.emitBatch([event],context)}emitBatch(events,context){if(this.closedError!==void 0||events.length===0)return Promise.resolve();let bound=events.map(event=>{let payload=structuredClone(event);ret…
+
+…lity:"high",description:"Provider response id"},"pi.ai.response.stop_reason":{type:"string",values:["stop","length","tool_use","error","aborted","deferred"],description:"Normalized terminal response reason"},"pi.ai.http.status_code":{type:"number",description:"Final HTTP status"},"pi.ai.usage.input_tokens":{type:"number",description:"Reported input tokens"},"pi.ai.usage.output_tokens":{type:"number",description:"Reported output tokens"},"pi.ai.usage.cache_read_tokens":{type:"number",description:"Reported cache-read tokens"},"pi.ai.usage.cache_write_tokens":{type:"number",description:"Reported cache-write tokens"},"pi.ai.usage.reasoning_tokens":{type:"number",description:"Reported reasoning tokens"},"pi.ai.usage.total_tokens":{type:"number",description:"Reported total tokens"},"pi.ai.usage.cost":{type:"number",description:"Reported total cost"},"pi.ai.stream.chunk_count":{type:"number",description:"Streamed update chunk count"},"pi.ai.stream.time_to_first_chunk_ms":{type:"number",description:"Elapsed milliseconds to first update chunk"},"pi.ai.error.type":{type:"…
+
+…ck,context){return getTelemetryContext(context).startSpan({name,attri…
+
+### docs mention of compaction settings (2)
+/Users/artrix/.npm-global/lib/node_modules/@earendil-works/pi-coding-agent/docs/compaction.md:1:# Compaction & Branch Summarization
+/Users/artrix/.npm-global/lib/node_modules/@earendil-works/pi-coding-agent/docs/compaction.md:3:LLMs have limited context windows. When conversations grow too long, Pi uses compaction to summarize older content while preserving recent work. This page covers both auto-compaction and branch summarization.
+/Users/artrix/.npm-global/lib/node_modules/@earendil-works/pi-coding-agent/docs/compaction.md:6:- [`packages/coding-agent/src/core/compaction/compaction.ts`](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/compaction/compaction.ts) - Auto-compaction logic
+/Users/artrix/.npm-global/lib/node_modules/@earendil-works/pi-coding-agent/docs/compaction.md:7:- [`packages/coding-agent/src/core/compaction/branch-summarization.ts`](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/compaction/branch-summarization.ts) - Branch summarization
+/Users/artrix/.npm-global/lib/node_modules/@earendil-works/pi-coding-agent/docs/compaction.md:8:- [`packages/coding-agent/src/core/compaction/utils.ts`](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/compaction/utils.ts) - Shared utilities (file tracking, serialization)
+/Users/artrix/.npm-global/lib/node_modules/@earendil-works/pi-coding-agent/docs/compaction.md:9:- [`packages/coding-agent/src/core/session-manager.ts`](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/session-manager.ts) - Entry types (`CompactionEntry`, `BranchSummaryEntry`)
+/Users/artrix/.npm-global/lib/node_modules/@earendil-works/pi-coding-agent/docs/compaction.md:20:| Compaction | Context exceeds threshold, or `/compact` | Summarize old messages to free up context |
+/Users/artrix/.npm-global/lib/node_modules/@earendil-works/pi-coding-agent/docs/compaction.md:23:Both use the same structured summary format and track file operations cumulatively. Compaction and branch-summary requests use fresh routing session IDs and, where supported by the provider, disable prompt-cache writes because these one-off prompts are unlikely to be reused.
+/Users/artrix/.npm-global/lib/node_modules/@earendil-works/pi-coding-agent/docs/compaction.md:25:## Compaction
+/Users/artrix/.npm-global/lib/node_modules/@earendil-works/pi-coding-agent/docs/compaction.md:29:Auto-compaction triggers when:
+/Users/artrix/.npm-global/lib/node_modules/@earendil-works/pi-coding-agent/docs/compaction.md:48:4. **Append entry**: Save `CompactionEntry` with summary and `firstKeptEntryId`
+/Users/artrix/.npm-global/lib/node_modules/@earendil-works/pi-coding-agent/docs/compaction.md:52:Before compaction:
+/Users/artrix/.npm-global/lib/node_modules/@earendil-works/pi-coding-agent/docs/compaction.md:63:After compaction (new entry appended):
+/Users/artrix/.npm-global/lib/node_modules/@earendil-works/pi-coding-agent/docs/compaction.md:83:On repeated compactions, th
+
+### docs mention of compaction settings (1)
+# docs mention of compaction settings
+
+$ grep -rn -i "compaction" /Users/artrix/.npm-global/lib/node_modules/@earendil-works/pi-coding-agent/docs/*.md | head -40
+
+## compact command retry
+
+### docs mention of compaction settings (2)
+/Users/artrix/.npm-global/lib/node_modules/@earendil-works/pi-coding-agent/docs/compaction.md:1:# Compaction & Branch Summarization
+/Users/artrix/.npm-global/lib/node_modules/@earendil-works/pi-coding-agent/docs/compaction.md:3:LLMs have limited context windows. When conversations grow too long, Pi uses compaction to summarize older content while preserving recent work. This page covers both auto-compaction and branch summarization.
+/Users/artrix/.npm-global/lib/node_modules/@earendil-works/pi-coding-agent/docs/compaction.md:6:- [`packages/coding-agent/src/core/compaction/compaction.ts`](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/compaction/compaction.ts) - Auto-compaction logic
+/Users/artrix/.npm-global/lib/node_modules/@earendil-works/pi-coding-agent/docs/compaction.md:7:- [`packages/coding-agent/src/core/compaction/branch-summarization.ts`](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/compaction/branch-summarization.ts) - Branch summarization
+/Users/artrix/.npm-global/lib/node_modules/@earendil-works/pi-coding-agent/docs/compaction.md:8:- [`packages/coding-agent/src/core/compaction/utils.ts`](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/compaction/utils.ts) - Shared utilities (file tracking, serialization)
+/Users/artrix/.npm-global/lib/node_modules/@earendil-works/pi-coding-agent/docs/compaction.md:9:- [`packages/coding-agent/src/core/session-manager.ts`](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/session-manager.ts) - Entry types (`CompactionEntry`, `BranchSummaryEntry`)
+/Users/artrix/.npm-global/lib/node_modules/@earendil-works/pi-coding-agent/docs/compaction.md:20:| Compaction | Context exceeds threshold, or `/compact` | Summarize old messages to free up context |
+/Users/artrix/.npm-global/lib/node_modules/@earendil-works/pi-coding-agent/docs/compaction.md:23:Both use the same structured summary format and track file operations cumulatively. Compaction and branch-summary requests use fresh routing session IDs and, where supported by the provider, disable prompt-cache writes because these one-off prompts are unlikely to be reused.
+/Users/artrix/.npm-global/lib/node_modules/@earendil-works/pi-coding-agent/docs/compaction.md:25:## Compaction
+/Users/artrix/.npm-global/lib/node_modules/@earendil-works/pi-coding-agent/docs/compaction.md:29:Auto-compaction triggers when:
+/Users/artrix/.npm-global/lib/node_modules/@earendil-works/pi-coding-agent/docs/compaction.md:48:4. **Append entry**: Save `CompactionEntry` with summary and `firstKeptEntryId`
+/Users/artrix/.npm-global/lib/node_modules/@earendil-works/pi-coding-agent/docs/compaction.md:52:Before compaction:
+/Users/artrix/.npm-global/lib/node_modules/@earendil-works/pi-coding-agent/docs/compaction.md:63:After compaction (new entry appended):
+/Users/artrix/.npm-global/lib/node_modules/@earendil-works/pi-coding-agent/docs/compaction.md:83:On repeated compactions, th
+
+### docs mention of compaction settings (1)
+# docs mention of compaction settings
+
+$ grep -rn -i "compaction" /Users/artrix/.npm-global/lib/node_modules/@earendil-works/pi-coding-agent/docs/*.md | head -40
+
+### find error string in pi source (2)
+…borted",response.errorMessage||"Turn prefix summarization aborted")):response.stopReason==="error"?err(new CompactionError("summarization_failed",`Turn prefix summarization failed: ${response.errorMessage||"Unknown error"}`)):ok({text:contentText(response.content),usage:response.usage})}var DEFAULT_RETRY_POLICY={enabled:!0,maxRetries:3,baseDelayMs:1e3,maxAgentDelayMs:DEFAULT_MAX_AGENT_RETRY_DELAY_MS};function validateToolNames(tools){let names2=new Set;for(let tool of tools){if(names2.has(tool.name))throw new TypeError(`Duplicate tool name: ${JSON.stringify(tool.name)}`);names2.add(tool.name)}}function validateRetryPolicy(policy){if(!Number.isSafeInteger(policy.maxRetries)||policy.maxRetries<0||policy.maxRetries===Number.MAX_SAFE_INTEGER||!Number.isSafeInteger(policy.baseDelayMs)||policy.baseDelayMs<0||policy.maxAgentDelayMs!==void 0&&(!Number.isSafeInteger(policy.maxAgentDelayMs)||policy.maxAgentDelayMs<0))throw new RangeError("Retry policy values must be finite non-negative safe integers")}function validateCompactionSettings(settings2){if(!Number.isSafeInteger(settings2.reserveTokens)||settings2.reserveTokens<0||!Number.isSafeInteger(settings2.keepRecentTokens)||settings2.keepRecentTokens<0)throw new RangeError("Compaction token counts must be finite non-negative safe integers")}var HarnessEventBus=class{listeners=new Map;watchListeners=new Set;deliveryTail=Promise.resolve();closedError;on(type,listener){if(this.closedError!==void 0)throw this.closedError;let wrapped=(event,context)=>listener(event,context)…
+
+…ck,context){return getTelemetryContext(context).startSpan({name,attributes},span=>callback(span,withTelemetryContext(span,context)))}var HOOK_NAMES=["before_run","before_drive","before_run_end","transform_context","before_request","before_payload","after_response","before_tool","after_tool","before_compaction","before_navigation"],EVENT_TYPES=["run_start","run_resume","run_suspend","operation_abort","run_end","fault","handler_error","turn_start","turn_end","retry_scheduled","retry_start","retry_end","message_start","message_update","message_end","tool_start","tool_update","tool_end","entry_added","queue_update","value_update","config_update","compaction_start","compaction_end","navigation_start","navigation_end","lane_created","usage"],operationStartAttributes={"pi.session.id":{type:"string",required:!0,cardinality:"high",description:"Session id"},"pi.lane.name":{type:"string",required:!0,cardinality:"high",description:"Lane name"},"pi.operation.id":{type:…
+
+…red:!0,values:["run"],description:"Run operation kind"}},endAttributes:{"pi.operation.outcome":{type:"string",values:["completed","aborted","failed","suspended"],description:"Run invocation outcome"},...operationErrorAttributes},status:{default:"ok",errorWhen:"The run fails or throws"}},"pi.harness.compaction":{description:"One admitted in-process manual compaction invocation",parents:{kind:"root_or_external"},startAttributes:{...operationStartAttributes,"pi.operation.kind":{type:"string",re…
+
+
+> **Tip:** Results are scoped to this batch only. To search across all indexed sources, use `ctx_search(queries: [...])` or call ctx_batch_execute with `query_scope: "global"`.
+
+Searchable terms for follow-up: collectentriesforbranchsummary, tokensbefore, preparebranchentries, summarization, preparation, extensions, assistant, threshold, different, messages, boundary, provider, requests, terminal, recovery, overflow, includes, settings, packages, context, aborted, unknown, content, message, whether, returns, default, session, attempt, summary, details, entries, windows, string, prefix, failed, length, tokens, manual, writes
