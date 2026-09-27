@@ -3,6 +3,7 @@ import {
   cosine,
   DenseChannel,
   fuseRrf,
+  LEXICAL_WEIGHT_DEFAULT,
   LexicalChannel,
   recall,
   RRF_K,
@@ -59,7 +60,52 @@ describe("fuseRrf", () => {
   });
 });
 
-describe("cosine", () => {
+describe("fuseRrf weights", () => {
+  it("defaults a channel to weight 1 when none is given", () => {
+    const weighted = fuseRrf([{ name: "x", hits: [{ id: "a", score: 1 }] }], 10);
+    const explicit = fuseRrf([{ name: "x", hits: [{ id: "a", score: 1 }], weight: 1 }], 10);
+    expect(weighted).toEqual(explicit);
+  });
+
+  it("scales a channel's contribution by its weight", () => {
+    const hits = [{ id: "a", score: 1 }];
+    const full = fuseRrf([{ name: "x", hits, weight: 1 }], 10);
+    const half = fuseRrf([{ name: "x", hits, weight: 0.5 }], 10);
+    expect(half[0].score).toBeCloseTo(full[0].score / 2, 10);
+  });
+
+  it("keeps a down-weighted channel's top hit below a strong rival's", () => {
+    // The regression this exists for: a lexical #1 that every grader marked
+    // irrelevant outranked the dense #1 that graded 2, because equal weights let
+    // the lexical hit collect a full 1/(K+1).
+    const fused = fuseRrf(
+      [
+        { name: "lexical", hits: [{ id: "noise", score: 9 }], weight: 0.4 },
+        { name: "dense", hits: [{ id: "answer", score: 0.8 }], weight: 1 },
+      ],
+      10,
+    );
+    expect(fused.map((h) => h.id)).toEqual(["answer", "noise"]);
+  });
+
+  it("keeps a zero-weight channel's ids traceable", () => {
+    const fused = fuseRrf(
+      [
+        { name: "lexical", hits: [{ id: "noise", score: 9 }], weight: 0 },
+        { name: "dense", hits: [{ id: "answer", score: 0.8 }], weight: 1 },
+      ],
+      10,
+    );
+    expect(fused[0].id).toBe("answer");
+    expect(fused.map((h) => h.id)).toContain("noise");
+  });
+
+  it("gives the lexical channel the measured default weight", () => {
+    expect(LEXICAL_WEIGHT_DEFAULT).toBe(0.4);
+  });
+});
+
+ describe("cosine", () => {
   it("is 1 for identical direction and 0 for orthogonal", () => {
     expect(cosine([1, 2], [1, 2])).toBeCloseTo(1, 10);
     expect(cosine([1, 0], [0, 1])).toBeCloseTo(0, 10);

@@ -35,6 +35,8 @@ export interface ChannelHit {
  *  absence stays visible. */
 export interface RecallChannel {
   name: string;
+  /** Fusion weight. Omitted means 1. */
+  weight?: number;
   search(query: string, limit: number): Promise<ChannelHit[]> | ChannelHit[];
 }
 
@@ -49,25 +51,50 @@ export interface FusedHit {
 /**
  * Reciprocal Rank Fusion over any number of channels.
  *
- * score(id) = Σ_channel 1 / (RRF_K + rank_channel(id))
+ * score(id) = Σ_channel weight_channel / (RRF_K + rank_channel(id))
  *
- * A channel that ranked a document highest contributes 1/(K+1); appearing in
+ * A channel that ranked a document highest contributes weight/(K+1); appearing in
  * several channels accumulates. Documents absent from a channel contribute
  * nothing from it, which is what lets a channel simply be dropped on failure.
+ *
+ * WHY WEIGHTS EXIST
+ * Equal weighting assumes the channels are comparably informative. Measured on the
+ * real corpus they are not: BM25 returned 10 candidates for a query about the
+ * term "waveterminal" and every one of them graded 0, while the dense channel put
+ * a grade-2 memory first. Under equal weights those ten irrelevant candidates
+ * earned RRF points, three of them outscored the correct answer, and a correct
+ * top-1 became rank 5. Across the gold set, equal weights scored nDCG@10 0.590
+ * where the dense channel alone scored 0.694.
+ *
+ * The lexical channel keeps real value on identifiers, file names, and error
+ * strings, where an exact term match is the strongest possible signal. Defaulting
+ * it to a lower weight keeps that value available while stopping a broad keyword
+ * match from displacing a semantically correct answer.
  */
-export function fuseRrf(channels: { name: string; hits: ChannelHit[] }[], limit: number, k = RRF_K): FusedHit[] {
+export function fuseRrf(
+  channels: { name: string; hits: ChannelHit[]; weight?: number }[],
+  limit: number,
+  k = RRF_K,
+): FusedHit[] {
   const acc = new Map<string, FusedHit>();
-  for (const { name, hits } of channels) {
+  for (const { name, hits, weight = 1 } of channels) {
     for (let rank = 0; rank < hits.length; rank++) {
       const id = hits[rank].id;
       const entry = acc.get(id) ?? { id, score: 0, ranks: {} };
       entry.ranks[name] = rank + 1;
-      entry.score += 1 / (k + rank + 1);
+      entry.score += weight / (k + rank + 1);
       acc.set(id, entry);
     }
   }
   return [...acc.values()].sort((a, b) => b.score - a.score || a.id.localeCompare(b.id)).slice(0, limit);
 }
+
+/** Default weight for the lexical channel in fusion. Chosen from the gold-set
+ *  ablation (equal 0.590, x0.4 0.667, dense-only 0.694 at nDCG@10): the weight
+ *  recovers most of the loss from a broad keyword match while keeping lexical
+ *  evidence in the pool for identifier-shaped queries. Set 1 to restore equal
+ *  weighting and reproduce the original behaviour. */
+export const LEXICAL_WEIGHT_DEFAULT = 0.4;
 
 // ---------------------------------------------------------------------------
 // Lexical channel
@@ -75,17 +102,23 @@ export function fuseRrf(channels: { name: string; hits: ChannelHit[] }[], limit:
 export interface LexicalChannelOptions {
   docs: { id: string; text: string }[];
   /** Pre-built index, so a caller scoring many queries builds it once. */
+  /** Index to share across channels, and the weight this channel contributes to
+   *  fusion (defaults to LEXICAL_WEIGHT_DEFAULT). */
   index?: Bm25Index;
+  weight?: number;
 }
 
 /** BM25 over the mirror. Synchronous and dependency-free by design: this is the
  *  channel that must answer when every provider is down. */
 export class LexicalChannel implements RecallChannel {
   readonly name = "lexical";
+  /** Fusion weight from config, so an ablation can restore equal weighting. */
+  readonly weight: number;
   private index: Bm25Index;
 
   constructor(opts: LexicalChannelOptions) {
     this.index = opts.index ?? buildBm25Index(opts.docs);
+    this.weight = opts.weight ?? LEXICAL_WEIGHT_DEFAULT;
   }
 
   search(query: string, limit: number): ChannelHit[] {
@@ -167,8 +200,13 @@ export interface FuseOptions {
   perChannelLimit?: number;
   /** Size of the fused pool handed to the reranker / returned. */
   fusedLimit?: number;
-  /** Optional final reordering stage over the fused pool. */
-  reranker?: (query: string, candidates: FusedHit[]) => Promise<ChannelHit[]> | ChannelHit[];
+  /** Resolves a hit id to the text a reranker needs. Channels return ids only, so
+   *  the payload lookup lives here and each channel stays free of storage
+   *  concerns. Without it a reranker cannot run. */
+  documentText?: (id: string) => string | undefined;
+  /** Optional final reordering stage over the fused pool. Receives the fused hits
+   *  and returns them in the new order. */
+  reranker?: (query: string, candidates: FusedHit[], textOf: (id: string) => string) => Promise<ChannelHit[]> | ChannelHit[];
   onChannelError?: (name: string, error: unknown) => void;
 }
 
@@ -196,17 +234,19 @@ export async function recall(opts: FuseOptions & { query: string }): Promise<Fus
       try {
         const hits = await ch.search(opts.query, perChannelLimit);
         status.push({ name: ch.name, ok: true, hits: hits.length });
-        return { name: ch.name, hits };
+        return { name: ch.name, hits, weight: ch.weight };
       } catch (err) {
         status.push({ name: ch.name, ok: false, error: err instanceof Error ? err.message : String(err), hits: 0 });
         opts.onChannelError?.(ch.name, err);
-        return { name: ch.name, hits: [] as ChannelHit[] };
+        return { name: ch.name, hits: [] as ChannelHit[], weight: ch.weight };
       }
     }),
   );
 
   const fused = fuseRrf(
-    settled.filter((c) => c.hits.length > 0),
+    settled
+      .filter((c) => c.hits.length > 0)
+      .map((c) => ({ name: c.name, hits: c.hits, weight: c.weight })),
     perChannelLimit,
   );
 
@@ -215,7 +255,9 @@ export async function recall(opts: FuseOptions & { query: string }): Promise<Fus
   }
 
   try {
-    const reranked = await opts.reranker(opts.query, fused.slice(0, perChannelLimit));
+    const resolve = opts.documentText ?? (() => "");
+    const textOf = (id: string): string => resolve(id) ?? "";
+    const reranked = await opts.reranker(opts.query, fused.slice(0, perChannelLimit), textOf);
     const order = new Map(reranked.map((h, i) => [h.id, i]));
     const byId = new Map(fused.map((h) => [h.id, h]));
     const ordered = [...fused]

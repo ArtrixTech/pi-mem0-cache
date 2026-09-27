@@ -30,11 +30,52 @@ The extension wraps `globalThis.fetch` inside the pi process and transparently i
 
 All memories seen in any API response are harvested into the local corpus, so the fallback search gets richer the longer you use it.
 
-**Embedding recall (Jina)**
+**Retrieval pipeline (dense + rerank)**
 
-When `JINA_API_KEY` is set, corpus memories are embedded incrementally (hash-tracked, one batch call; sidecar at `~/.pi/agent/mem0-vectors.json`) and gated/fallback `search` reads are ranked by **cosine similarity** against the query embedding — semantic recall over the mirror, replacing the keyword-overlap ranking whenever the vectors cover the corpus. Provider failures (HTTP errors, timeouts) trigger a 1-minute cooldown and instant degradation to the keyword ranking; answers never break because of the embedding layer. Model default: `jina-embeddings-v5-text-nano` (768 dims, OpenAI-compatible `api.jina.ai/v1/embeddings`); override with `MEM0_EMBED_MODEL`. `MEM0_EMBED=0` forces the layer off; vectors live in a separate sidecar (`MEM0_VECTORS_PATH`). `/mem0-cache embed` shows corpus coverage; `/mem0-cache embed refresh` forces a full re-embed.
+The local answer is produced by a staged pipeline: **retrieve broadly, then reorder carefully**.
 
-Shadow entries carry an optional vector side (`localVec`, `overlapVec5/10`, `mrrVec`) next to the keyword ranking, so both recall strategies are measured against the remote answer in `/mem0-cache shadow`.
+| Stage | What it does | Provider needed |
+|---|---|---|
+| **Dense** | Embeds the query and ranks the mirror by cosine similarity — finds paraphrases, cross-language matches, and topics that share no words with the query | yes (embeddings) |
+| **Rerank** | A cross-encoder reads the query and each top candidate *together* and reorders them | yes (rerank) |
+| **BM25** | CJK-bigram + BM25 keyword ranking over the mirror | no — pure local arithmetic |
+
+Embeddings run through an OpenAI-compatible endpoint. Default provider is OpenRouter with `qwen/qwen3-embedding-8b`; Jina is the secondary. Reranking defaults to `voyageai/rerank-2.5-lite` via OpenRouter (`MEM0_RERANK_MODEL`). Vectors are hash-tracked in a sidecar at `~/.pi/agent/mem0-vectors.json` and refreshed incrementally.
+
+**Strategy resolution.** `MEM0_RECALL_STRATEGY` selects the pipeline, defaulting to `auto`, which resolves against what is actually available:
+
+```
+dense+rerank   ← embeddings and reranker both working   (nDCG@10 0.821)
+     ↓         embeddings working, no reranker          (nDCG@10 0.677)
+   dense
+     ↓         no provider at all — the availability floor (nDCG@10 0.346)
+   bm25
+```
+
+Every step down is recorded in the shadow log rather than applied silently. An explicit strategy (`dense`, `fusion`, `dense+rerank`, `bm25`, `legacy`) pins the pipeline and disables the ladder, which is what makes A/B runs meaningful. `/mem0-cache provider` prints the resolved plan, what was skipped and why, and each provider's credential source.
+
+**Why BM25 is not in the serving path.** It was measured, and it lost: scoring 57 judged queries over a mean 2570 in-scope memories, `fusion` reached nDCG@10 0.633 against `dense`'s 0.677, and `fusion+rerank` tied `dense+rerank` at 0.821 while running one extra channel. With a reranker already reordering the pool, lexical candidates consume slots that have to be reordered past. BM25 keeps the role it is actually good at — the local floor that answers when every provider is gone, and precise matching on identifiers, file names, and error strings. `MEM0_FUSION_BM25_WEIGHT` (default 0.4) controls its weight when a fusion strategy is explicitly requested.
+
+Providers are optional by construction. A dead embedding key degrades to BM25; a dead reranker key degrades to dense; a failed rerank call mid-session degrades to the fused order for that read. Recall never depends on a single provider answering, and no degradation is silent.
+
+**Shadow logger**
+
+Every `search` that misses the cache also records a comparison entry to `~/.pi/agent/mem0-shadow.jsonl` (override with `MEM0_CACHE_SHADOW_PATH`; disable with `MEM0_CACHE_SHADOW=0`): the ranking the freshness gate would have served locally, next to the remote mem0 ranking, with `overlap@5`/`overlap@10`, the reciprocal rank of the remote top-1 in the local list (MRR), and a `mode` (`remote` = answered by the API, `fallback` = API failed and the mirror answered). On the success path the comparison runs *before* the response is harvested, so the local ranking reflects the true pre-fetch corpus state.
+
+In test mode (`MEM0_RECALL_TEST=1`, or any explicit `MEM0_RECALL_STRATEGY`) each entry records **every** strategy's ranking as ids — `legacy`, `bm25`, `dense`, `fusion`, `dense+rerank` — plus vocabulary-gap and per-channel failure fields, all scored against the same remote ground truth. `/mem0-cache shadow` prints the comparison table sorted by MRR plus a channel-error tally. Test mode changes what is measured, never what the agent receives.
+
+**Offline evaluation**
+
+The shadow log measures *agreement with mem0*, which cannot tell "local found the better answer" from "local failed to imitate mem0". `scripts/` carries a second, independent harness:
+
+```bash
+node scripts/build-gold.mjs --sample 80 --per-bucket 30   # sample queries from the shadow log
+node scripts/retrieve-full.mjs --k 10                      # run every strategy over the FULL corpus
+node scripts/judge-gold.mjs --concurrency 6                # grade each (query, memory) pair via LLM
+node scripts/score-full.mjs --by-shape                     # nDCG@10 / R@10 / MRR per strategy
+```
+
+`retrieve-full.mjs` is deliberately not a re-ranker of a pre-built pool: each strategy runs against every in-scope memory (mean 2570) and returns its own top-K, and the judged pool is the *union* of those top-Ks. A pool built from one retriever's output can only ever contain that retriever's answers, which would penalise the others for finding things it missed. `judge-gold.mjs` reuses grades across gold files, so widening the candidate pool costs only the new candidates.
 
 **Full mirror (`pull-all`)**
 
@@ -71,6 +112,7 @@ or from the git source directly: `"git:https://github.com/ArtrixTech/pi-mem0-cac
 /mem0-cache clear       # wipe the read cache (keep local memories)
 /mem0-cache clear-all   # wipe everything
 /mem0-cache path        # show store location
+/mem0-cache provider    # credentials, resolved serving strategy, capabilities, skipped plans
 /mem0-cache shadow      # local-vs-remote search agreement stats from the shadow log
 /mem0-cache embed       # embedding layer status (vectors/corpus, model, last error)
 /mem0-cache embed refresh # force a full re-embed of the corpus
@@ -81,7 +123,31 @@ or from the git source directly: `"git:https://github.com/ArtrixTech/pi-mem0-cac
 
 Everything lives in one JSON file: `~/.pi/agent/mem0-cache.json` (override with `MEM0_CACHE_PATH`). Human-readable; safe to inspect or hand-edit while pi is stopped.
 
-TTL defaults to 24h; override with `MEM0_CACHE_TTL_MS`. The freshness gate defaults to 1h; override with `MEM0_CACHE_REMOTE_READ_INTERVAL_MS`. The shadow log is a separate JSONL sidecar at `~/.pi/agent/mem0-shadow.jsonl`; it rotates to the most recent 2000 lines once it exceeds 4MB. Embedding vectors live in `~/.pi/agent/mem0-vectors.json` (override with `MEM0_VECTORS_PATH`); the layer activates when `JINA_API_KEY` is present and can be forced off with `MEM0_EMBED=0`.
+TTL defaults to 24h; override with `MEM0_CACHE_TTL_MS`. The freshness gate defaults to 1h; override with `MEM0_CACHE_REMOTE_READ_INTERVAL_MS`. The shadow log is a separate JSONL sidecar at `~/.pi/agent/mem0-shadow.jsonl`; it rotates to the most recent 2000 lines once it exceeds 4MB. Embedding vectors live in `~/.pi/agent/mem0-vectors.json` (override with `MEM0_VECTORS_PATH`).
+
+### Environment
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `MEM0_RECALL_STRATEGY` | `auto` | Pin a pipeline: `auto`, `dense+rerank`, `dense`, `fusion+rerank`, `fusion`, `bm25`, `legacy` |
+| `MEM0_RECALL_TEST` | off | `1` enables per-strategy shadow comparison without changing answers |
+| `MEM0_EMBED_PROVIDER` | `openrouter` then `jina` | Which embeddings provider to use |
+| `MEM0_EMBED_MODEL` | per provider | Override the embedding model |
+| `MEM0_RERANK_MODEL` | `voyageai/rerank-2.5-lite` | Reranker model |
+| `MEM0_RERANK` | on | `0` disables reranking entirely |
+| `MEM0_FUSION_BM25_WEIGHT` | `0.4` | Lexical channel weight when a fusion strategy is requested |
+| `MEM0_EMBED` | on | `0` forces the embedding layer off |
+| `MEM0_MAX_MEMORY_CHARS` | `4000` | Harvest cap; oversized memories are truncated and quarantined |
+
+### Credentials
+
+Keys are read from the environment first, then from the macOS Keychain. Nothing writes a key to disk in plaintext:
+
+```bash
+./scripts/setup-key.sh openrouter   # hidden prompt, stored in Keychain
+./scripts/setup-key.sh --list       # show which services hold a key
+./scripts/setup-key.sh --verify openrouter
+```
 
 ## Design notes
 
@@ -92,11 +158,12 @@ TTL defaults to 24h; override with `MEM0_CACHE_TTL_MS`. The freshness gate defau
 
 ## Limitations
 
-- Local fallback search is keyword overlap, not semantic. It's a degradation ladder, not a mem0 replacement.
+- A provider is required for the best pipeline. Without an embeddings key the local answer is BM25 keyword ranking, which is a real fallback and measurably weaker (nDCG@10 0.346 against 0.821).
 - The freshness gate and 429 breaker cover only locally-synthesizable reads (`search`, `get_all`, `get`); `history` and unknown reads stay on the network path.
 - A failed non-read (e.g. `history`) with no cache and no local match returns the original API error.
 - Single-process assumption: concurrent pi instances share the JSON store via last-writer-wins debounced writes.
 - Sync uploads are plain `add`s — if a memory was *also* added to mem0 by another client during the outage, a duplicate may result.
+- The gold set is 57 queries frozen to one corpus snapshot. It is large enough to rank strategies and too small to resolve differences under ~0.03 nDCG.
 
 ## Development
 
