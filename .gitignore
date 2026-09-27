@@ -6,3 +6,5 @@ dist/
 # Gold-set build artifacts: keyed to a corpus snapshot, regenerate with scripts/build-gold.mjs
 gold-candidates.json
 gold.json
+.embed-cache.json
+gold-*.json

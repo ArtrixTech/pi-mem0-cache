@@ -105,9 +105,30 @@ function shapeOf(query) {
 function isNoise(query) {
   const q = query.trim();
   if (q.length < MIN_QUERY_CHARS || q.length > MAX_QUERY_CHARS) return true;
-  if (q.startsWith("/") && !q.includes(" ")) return true;
-  if (/waveterm_paste|\/var\/folders|^[A-Za-z]:\\/.test(q)) return true;
+  // Strip wrapping quotes first: a quoted path is still a path.
+  const bare = q.replace(/^['"`]|['"`]$/g, "").trim();
+  // A lone path, with or without a file extension, is a paste rather than a query.
+  if (/^(\/|[A-Za-z]:\\|~\/)/.test(bare) && !/\s/.test(bare)) return true;
+  // A path that is most of the string, even with trailing words.
+  if (/^(\/|[A-Za-z]:\\|~\/)\S*\.[A-Za-z0-9]{1,5}$/.test(bare)) return true;
+  if (/waveterm_paste|\/var\/folders/.test(q)) return true;
+  // Slash-commands and agent control strings.
+  if (/^\/\S+$/.test(bare)) return true;
   if (/^[\s\p{P}\p{S}]+$/u.test(q)) return true;
+  // Raw tool/JSON payloads leaked into a query field.
+  if (/^[{[]/.test(bare) && /[}\]]$/.test(bare)) return true;
+  // Diagnostics and log excerpts: a bracketed tag or a file path anywhere in a
+  // long string means the user pasted output, and no memory answers a paste.
+  if (/^\[/.test(bare) && /[~/\/]\.?\w+\//.test(bare)) return true;
+  if (/\b(error|warning|traceback|stack trace|enclosing|at line \d+)\b/i.test(q) && /[~/\/]/.test(q)) return true;
+  // Config/launch dumps: a leading step marker followed by 4+ numbered items.
+  if (/^\s*\d+\./.test(q) && (q.match(/\d+\./g) ?? []).length >= 4) return true;
+  // Subagent dispatch prompts. A routed task is not what a retrieval system is
+  // asked to answer; including them would let lane instructions dominate the set.
+  if (/^Task:\s/.test(bare)) return true;
+  if (/^\s*You are (an?|the)\b.*(lane|agent|researcher)/i.test(bare)) return true;
+  // Scratch probes that leaked into traffic (smoke tests, connectivity checks).
+  if (/^Reply with exactly\b/i.test(bare)) return true;
   return false;
 }
 
