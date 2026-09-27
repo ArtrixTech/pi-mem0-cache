@@ -158,29 +158,83 @@ describe("ensureEmbeddings", () => {
 });
 
 describe("createEmbedHarness", () => {
-  it("ranks by vectors and falls back to null on failure", async () => {
+  it("ranks by vectors and persists the corpus", async () => {
     const store = storeWith(mem("a", "alpha"), mem("b", "beta"));
     const vecStore = emptyVectorStore();
     const save = vi.fn();
-    let fail = false;
     const embedder: Embedder = {
       model: "test-model",
-      embed: async (texts) => {
-        if (fail) throw new Error("jina down");
-        return texts.map((t) => (t === "alpha query" ? [0.95, 0.05] : t === "alpha" ? [1, 0] : [0.9, 0.1]));
-      },
+      embed: async (texts) => texts.map((t) => (t === "alpha query" ? [0.95, 0.05] : t === "alpha" ? [1, 0] : [0.9, 0.1])),
     };
     const harness = createEmbedHarness(store, save, vecStore, embedder);
 
     const ranked = await harness.search("alpha query");
     expect(ranked?.map((s) => s.m.id)).toEqual(["a", "b"]);
     expect(save).toHaveBeenCalled(); // corpus was embedded and persisted
+  });
 
-    fail = true;
-    expect(await harness.search("alpha query")).toBeNull(); // cooldown + null
+  it("degrades one read without cooling down when only the query embed fails", async () => {
+    // The distinction this pins: a query embedding is a network round trip that
+    // can fail transiently, measured at 1.3s to 5.0s against a 45s ceiling in the
+    // live provider. Treating that as a layer failure disabled dense retrieval for
+    // a full minute on a single blip.
+    const store = storeWith(mem("a", "alpha"));
+    const vecStore = emptyVectorStore();
+    const embedder: Embedder = {
+      model: "test-model",
+      embed: async (texts) => {
+        if (texts.length === 1 && texts[0].includes(" q")) throw new Error("query timeout");
+        return texts.map(() => [1, 0]);
+      },
+    };
+    const harness = createEmbedHarness(store, () => {}, vecStore, embedder);
+
+    expect(await harness.search("alpha q")).toBeNull();
     const s = harness.status();
-    expect(s.lastError).toContain("jina down");
+    expect(s.lastError).toContain("query embedding failed");
+    // No cooldown: the next read tries again rather than being served by BM25.
+    expect(s.cooldownUntil).toBeUndefined();
+    expect(s.enabled).toBe(true);
+  });
+
+  it("caches a query embedding so a repeated query costs one call", async () => {
+    const store = storeWith(mem("a", "alpha"));
+    const vecStore = emptyVectorStore();
+    let queryEmbeds = 0;
+    const embedder: Embedder = {
+      model: "test-model",
+      embed: async (texts) => {
+        // The backfill embeds corpus texts; a single-input call for a known query
+        // is what the cache should absorb.
+        if (texts.length === 1 && texts[0] === "repeat me") queryEmbeds++;
+        return texts.map(() => [1, 0]);
+      },
+    };
+    const harness = createEmbedHarness(store, () => {}, vecStore, embedder);
+
+    await harness.search("repeat me");
+    await harness.search("repeat me");
+    await harness.search("repeat me");
+    expect(queryEmbeds).toBe(1);
+  });
+
+  it("cools down when the corpus backfill fails", async () => {
+    // A corpus failure is the persistent case: a bad key or an exhausted quota
+    // fails every request, so retrying immediately would repeat it.
+    const store = storeWith(mem("a", "alpha"));
+    const vecStore = emptyVectorStore();
+    const embedder: Embedder = {
+      model: "test-model",
+      embed: async () => {
+        throw new Error("embedding 401: bad key");
+      },
+    };
+    const harness = createEmbedHarness(store, () => {}, vecStore, embedder);
+
+    expect(await harness.search("anything")).toBeNull();
+    const s = harness.status();
     expect(s.cooldownUntil).toBeDefined();
+    expect(s.enabled).toBe(false);
   });
 });
 

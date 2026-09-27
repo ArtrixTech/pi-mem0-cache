@@ -1253,6 +1253,9 @@ export interface EnsureProgress {
   corpus: number;
   /** Batches that failed and were skipped; the next call retries them. */
   failedBatches: number;
+  /** Batches attempted in this call. A call where every batch failed is a
+   *  persistent provider failure rather than a few unlucky inputs. */
+  batches?: number;
   /** Targets still lacking a vector once this call finished. Zero means the
    *  sidecar covers the corpus. */
   remaining: number;
@@ -1323,7 +1326,7 @@ export async function ensureEmbeddings(
   }
   const remaining = targets.length;
   if (remaining === 0) {
-    return { embedded: 0, corpus: live.length, failedBatches: 0, remaining: 0, migratedNormalization };
+    return { embedded: 0, corpus: live.length, failedBatches: 0, batches: 0, remaining: 0, migratedNormalization };
   }
 
   const batchSize = opts.batchSize ?? EMBED_BATCH_SIZE;
@@ -1372,6 +1375,7 @@ export async function ensureEmbeddings(
     embedded,
     corpus: live.length,
     failedBatches,
+    batches: todo.length,
     remaining: remaining - embedded,
     migratedNormalization,
     ...(firstError ? { firstError } : {}),
@@ -1405,11 +1409,54 @@ export function createEmbedHarness(
 ): EmbedHarness {
   let cooldownUntil = 0;
   let lastError: string | undefined;
-  const fail = (err: unknown): void => {
+  /** Whether the last failure was persistent (corpus-level) or transient
+   *  (this read's query embedding). Only a persistent failure disables the layer:
+   *  a query embedding is one network round trip, and a single blip must not route
+   *  the next read to BM25. */
+  let errorKind: "none" | "transient" | "persistent" = "none";
+  const fail = (err: unknown, kind: "transient" | "persistent" = "persistent"): void => {
     lastError = err instanceof Error ? err.message : String(err);
-    cooldownUntil = Date.now() + EMBED_COOLDOWN_MS;
+    errorKind = kind;
+    if (kind === "persistent") cooldownUntil = Date.now() + EMBED_COOLDOWN_MS;
   };
   let ensurePromise: Promise<void> | null = null;
+  /** Query embeddings, keyed by query text. An agent re-issues similar queries
+   *  constantly, and a query embedding is a 1-5s network round trip, so a repeat
+   *  should not pay for it twice. Bounded so a long session cannot grow it
+   *  without limit. */
+  const queryCache = new Map<string, number[]>();
+  const QUERY_CACHE_MAX = 256;
+  /**
+   * Embed one query.
+   *
+   * Kept separate from `ensure()` on purpose. The corpus backfill and a query
+   * embedding fail for different reasons and deserve different responses: a
+   * corpus failure means the layer cannot work at all, while a query failure —
+   * measured at 1.3s to 5.0s against a 45s ceiling, so genuine timeouts are rare —
+   * should degrade this one read and leave the layer usable for the next one. A
+   * shared `fail()` call meant a single network blip disabled dense retrieval for
+   * a full minute.
+   */
+  const embedQuery = async (query: string): Promise<number[] | null> => {
+    const hit = queryCache.get(query);
+    if (hit) return hit;
+    try {
+      const [vec] = await embedder.embed([query]);
+      if (!vec) return null;
+      const unit = normalizeVec(vec);
+      if (queryCache.size >= QUERY_CACHE_MAX) {
+        // Drop the oldest insertion; Map preserves insertion order.
+        const oldest = queryCache.keys().next().value;
+        if (oldest !== undefined) queryCache.delete(oldest);
+      }
+      queryCache.set(query, unit);
+      return unit;
+    } catch (err) {
+      lastError = `query embedding failed: ${err instanceof Error ? err.message : String(err)}`;
+      errorKind = "transient";
+      return null;
+    }
+  };
   /** Coverage reached by the last ensure, for the status report. */
   let lastProgress: { embedded: number; failedBatches: number; remaining: number } | undefined;
   const ensure = (): Promise<void> => {
@@ -1422,8 +1469,20 @@ export function createEmbedHarness(
         const r = await ensureEmbeddings(store, vecStore, embedder, { save: saveVectors });
         lastProgress = { embedded: r.embedded, failedBatches: r.failedBatches, remaining: r.remaining };
         // Partial success is the normal path while a large corpus backfills, so a
-        // few failed batches are recorded rather than treated as a dead layer.
-        lastError = r.failedBatches > 0 ? `${r.failedBatches} batch(es) failed: ${r.firstError ?? "unknown"}` : undefined;
+        // few failed batches are recorded rather than treated as a dead layer. A
+        // call where EVERY batch failed is the opposite case: the provider is not
+        // answering at all, and retrying each read would waste a request every
+        // time. ensureEmbeddings catches per batch, so this is the only place the
+        // distinction can be drawn.
+        if (r.failedBatches === 0) {
+          lastError = undefined;
+          errorKind = "none";
+        } else if (r.failedBatches >= (r.batches ?? r.failedBatches)) {
+          fail(`all ${r.failedBatches} batch(es) failed: ${r.firstError ?? "unknown"}`);
+        } else {
+          lastError = `${r.failedBatches} batch(es) failed: ${r.firstError ?? "unknown"}`;
+          if (errorKind === "none") errorKind = "persistent";
+        }
         // Keep going in the background while coverage is incomplete: each call is
         // bounded, so a large first backfill finishes over several rounds instead
         // of holding a session open for ten minutes. `void` because the search that
@@ -1450,9 +1509,20 @@ export function createEmbedHarness(
       await ensure();
       const withVec = Object.values(store.memories).filter((m) => !m.deleted && vecStore.vectors[m.id]);
       if (withVec.length === 0) return null;
-      const [queryVec] = await embedder.embed([query]);
-      return searchLocalVector(queryVec, withVec, vecStore.vectors);
+      const queryVec = await embedQuery(query);
+      if (!queryVec) return null;
+      const ranked = searchLocalVector(queryVec, withVec, vecStore.vectors);
+      // Clear only a prior transient query failure. A persistent error is cleared
+      // by the backfill succeeding, not by one query working.
+      if (errorKind === "transient") {
+        lastError = undefined;
+        errorKind = "none";
+      }
+      return ranked;
     } catch (err) {
+      // A corpus-embedding failure is persistent (bad key, exhausted quota) and
+      // disables the layer. A query failure is transient, and the two paths are
+      // separated: `embedQuery` reports its own failure without a cooldown.
       fail(err);
       return null;
     }
@@ -1463,7 +1533,7 @@ export function createEmbedHarness(
     // enabled=false on an empty sidecar would route every read to BM25 for the
     // whole first backfill. A failed call or an active cooldown is what disables
     // it, and `search()` returns null when the corpus genuinely has no vectors.
-    enabled: Date.now() >= cooldownUntil && lastError === undefined,
+    enabled: Date.now() >= cooldownUntil && errorKind !== "persistent",
     model: embedder.model,
     vectors: Object.keys(vecStore.vectors).length,
     corpus: Object.values(store.memories).filter((m) => !m.deleted).length,
