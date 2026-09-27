@@ -29,7 +29,17 @@ import { createHash, randomUUID } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import { LexicalChannel, recall, type ChannelHit, type ChannelStatus, type FusedHit, type RecallChannel } from "./recall/fusion.js";
+import {
+  LEXICAL_WEIGHT_DEFAULT,
+  LexicalChannel,
+  recall,
+  type ChannelHit,
+  type ChannelStatus,
+  type FusedHit,
+  type RecallChannel,
+} from "./recall/fusion.js";
+import { createDefaultReranker, type RerankFn } from "./recall/rerank.js";
+import { parseStrategy, resolveStrategy } from "./recall/plan.js";
 import { extractScope, filterByScope, matchesScope, type ScopeFilters } from "./recall/scope.js";
 
 const DEFAULT_STORE_PATH = join(homedir(), ".pi", "agent", "mem0-cache.json");
@@ -56,6 +66,17 @@ export const EMBED_PROVIDERS: Record<string, { endpoint: string; keyEnv: string;
   },
 };
 const EMBED_COOLDOWN_MS = 60 * 1000;
+/** Inputs per embedding request, and the character budget that caps a larger
+ *  batch. 64 x ~250 chars is roughly 4K tokens: large enough to be efficient,
+ *  small enough to finish inside the per-request timeout. A batch is closed at
+ *  whichever limit is reached first, so a run of unusually long memories produces
+ *  more, smaller requests rather than one oversized one. */
+const EMBED_BATCH_SIZE = Number(process.env.MEM0_EMBED_BATCH_SIZE) > 0 ? Number(process.env.MEM0_EMBED_BATCH_SIZE) : 64;
+const EMBED_BATCH_CHARS = 16_000;
+/** Batches per `ensure()` call. 8 x 64 inputs is 512 memories, roughly 75s at ~9s
+ *  per batch. Bounded so a first backfill never blocks a session for minutes; the
+ *  next call resumes from the sidecar. Raise with MEM0_EMBED_MAX_BATCHES. */
+const EMBED_MAX_BATCHES_PER_CALL = Number(process.env.MEM0_EMBED_MAX_BATCHES) > 0 ? Number(process.env.MEM0_EMBED_MAX_BATCHES) : 8;
 const WRAPPED = Symbol.for("pi-mem0-cache.wrapped");
 const MAX_FALLBACK_RESULTS = 10;
 /** Harvest guard: memories longer than this are truncated. A single 250K-char
@@ -294,6 +315,22 @@ function truncateSafe(text: string, cap: number): string {
   return last >= 0xd800 && last <= 0xdbff ? sliced.slice(0, -1) : sliced;
 }
 
+/**
+ * Enforce the memory size bound, reporting what was cut.
+ *
+ * Applied on both entry points: harvesting a response and applying a local write.
+ * One path without it was enough for a 250,819-character memory to enter the
+ * corpus, where it failed every upload (mem0 answered HTTP 400) and every
+ * embedding request, blocking the dense channel until it was found.
+ *
+ * The cut text goes to the quarantine sidecar, so nothing is silently destroyed.
+ */
+export function clampMemory(text: string, id: string): { text: string; overflow?: MemoryOverflow } {
+  if (text.length <= MAX_MEMORY_CHARS) return { text };
+  appendQuarantine({ id, chars: text.length, memory: text });
+  return { text: truncateSafe(text, MAX_MEMORY_CHARS), overflow: { originalChars: text.length, truncatedAt: MAX_MEMORY_CHARS } };
+}
+
 /** Append the full original text of a truncated memory to the quarantine
  *  sidecar, so nothing the guard dropped becomes unrecoverable. */
 function appendQuarantine(entry: { id: string; chars: number; memory: string }): void {
@@ -325,24 +362,18 @@ export function harvestMemories(store: Store, bodyText: string): void {
     const existing = store.memories[m.id];
     // Never let an observed copy overwrite a local write.
     if (existing?.source === "local") continue;
-    let text = m.memory;
-    let overflow: MemoryOverflow | undefined;
-    if (text.length > MAX_MEMORY_CHARS) {
-      overflow = { originalChars: text.length, truncatedAt: MAX_MEMORY_CHARS };
-      appendQuarantine({ id: m.id, chars: text.length, memory: text });
-      text = truncateSafe(text, MAX_MEMORY_CHARS);
-      store.stats.harvestDropped = (store.stats.harvestDropped ?? 0) + 1;
-    }
+    const clamped = clampMemory(m.memory, m.id);
     store.memories[m.id] = {
       ...m,
       id: m.id,
-      memory: text,
+      memory: clamped.text,
       created_at: typeof m.created_at === "string" ? m.created_at : new Date().toISOString(),
       updated_at: typeof m.updated_at === "string" ? m.updated_at : new Date().toISOString(),
       deleted: false,
       source: "observed",
-      ...(overflow ? { overflow } : {}),
+      ...(clamped.overflow ? { overflow: clamped.overflow } : {}),
     } as LocalMemory;
+    if (clamped.overflow) store.stats.harvestDropped = (store.stats.harvestDropped ?? 0) + 1;
   }
 }
 
@@ -417,15 +448,27 @@ export async function rankLocal(
     localStrategy?: LocalStrategy;
     reranker?: Reranker;
     scope?: ScopeFilters;
+    /** Fusion weight for the lexical channel; see LEXICAL_WEIGHT_DEFAULT. */
+    lexicalWeight?: number;
     onStrategy?: (info: { strategy: LocalStrategy; degraded?: string; channels: ChannelStatus[] }) => void;
   } = {},
   limit = MAX_FALLBACK_RESULTS,
 ): Promise<LocalMemory[]> {
-  const requested = opts.localStrategy ?? "fusion";
-  const channels: RecallChannel[] = [];
-  const notes: ChannelStatus[] = [];
+  const requested = opts.localStrategy ?? "auto";
 
-  if (requested === "legacy") {
+  // Resolve what can actually run before touching the corpus: the ladder reports
+  // which plans were skipped and why, and it always lands on something servable.
+  const resolution = resolveStrategy(requested, {
+    // `enabled` is the harness' own health flag: it clears on a successful call
+    // and sets on a failure with a cooldown, which is exactly the signal the
+    // ladder needs to route around a dead embedding provider.
+    dense: opts.embed !== undefined && opts.embed.status().enabled,
+    rerank: opts.reranker !== undefined,
+  });
+  const plan = resolution.plan;
+
+  if (plan.strategy === "legacy") {
+    opts.onStrategy?.({ strategy: "legacy", channels: [] });
     return filterByScope(searchLocal(store, query, limit), opts.scope) as LocalMemory[];
   }
 
@@ -433,41 +476,63 @@ export async function rankLocal(
   const scoped = Object.values(store.memories).filter((m) => !m.deleted && matchesScope(m, opts.scope));
   const docs = scoped.map((m) => ({ id: m.id, text: m.memory }));
 
-  if (requested !== "dense") {
-    channels.push(new LexicalChannel({ docs }));
-  }
-  if (requested !== "bm25" && opts.embed) {
-    channels.push(new EmbedHarnessChannel(opts.embed, scoped));
+  const channels: RecallChannel[] = [];
+  for (const name of plan.channels) {
+    if (name === "lexical") {
+      channels.push(new LexicalChannel({ docs, weight: opts.lexicalWeight ?? LEXICAL_WEIGHT_DEFAULT }));
+    } else if (opts.embed) {
+      channels.push(new EmbedHarnessChannel(opts.embed, scoped));
+    }
   }
 
-  let degraded: string | undefined;
+  // The resolver only admits a dense plan when the harness reports healthy, and
+  // the harness can fail between that check and this call. The recall step drops a
+  // throwing channel, so a plan that loses its only channel falls back here.
   if (channels.length === 0) {
-    // "dense" requested but nothing to serve it: fall back to lexical rather
-    // than answering nothing.
-    degraded = `no channel for strategy "${requested}"`;
-    channels.push(new LexicalChannel({ docs }));
+    channels.push(new LexicalChannel({ docs, weight: opts.lexicalWeight ?? LEXICAL_WEIGHT_DEFAULT }));
   }
 
   const reranker =
-    requested === "fusion+rerank" && opts.reranker
-      ? (q: string, c: FusedHit[]) => opts.reranker!(q, c)
+    plan.rerank && opts.reranker
+      ? (q: string, c: FusedHit[], textOf: (id: string) => string) => opts.reranker!(q, c, textOf)
       : undefined;
-  if (requested === "fusion+rerank" && !opts.reranker) degraded = "no reranker configured";
 
   const result = await recall({
     query,
     channels,
     perChannelLimit: 50,
     fusedLimit: limit,
+    // Channels return ids; the reranker needs the document body. Resolving it
+    // here keeps payload storage out of the channel implementations.
+    documentText: (id) => store.memories[id]?.memory ?? "",
     reranker,
   });
 
-  let strategy: LocalStrategy = requested;
-  if (degraded) strategy = channels.some((c) => c.name === "lexical") ? "bm25" : requested;
+  // Report the strategy that actually answered. A channel that failed mid-call
+  // leaves a plan whose name no longer describes what produced the hits, and the
+  // shadow log must record the truth.
+  const survivors = result.status.filter((s) => s.ok).map((s) => s.name);
+  const served = describeServed(survivors, result.reranked);
+  const degraded =
+    resolution.degraded ??
+    (served !== plan.strategy
+      ? `${plan.strategy} served as ${served}: ${result.status.filter((s) => !s.ok).map((s) => `${s.name} (${s.error ?? "failed"})`).join(", ")}`
+      : undefined);
 
-  opts.onStrategy?.({ strategy, degraded, channels: result.status });
+  opts.onStrategy?.({ strategy: served, ...(degraded ? { degraded } : {}), channels: result.status });
   const ids = result.hits.map((h) => h.id);
   return materialize(store, ids, limit);
+}
+
+/** Name the pipeline that produced a result, from its surviving channels and
+ *  whether a rerank happened. A single surviving channel is named alone so a plan
+ *  that lost a channel reports what genuinely served the read. */
+function describeServed(survivors: string[], reranked: boolean): LocalStrategy {
+  const hasLexical = survivors.includes("lexical");
+  const hasDense = survivors.includes("dense");
+  if (hasLexical && hasDense) return reranked ? "fusion+rerank" : "fusion";
+  if (hasDense) return reranked ? "dense+rerank" : "dense";
+  return "bm25";
 }
 
 /** Adapts the embedding harness' search to the channel interface.
@@ -490,7 +555,13 @@ class EmbedHarnessChannel implements RecallChannel {
 }
 
 /** Cross-encoder reranking of a fused candidate pool. */
-export type Reranker = (query: string, candidates: FusedHit[]) => Promise<ChannelHit[]>;
+/** Final reordering stage over the fused pool. Receives the fused hits and a
+ *  resolver for their texts, and returns them in the new order. */
+export type Reranker = (
+  query: string,
+  candidates: FusedHit[],
+  textOf: (id: string) => string,
+) => Promise<ChannelHit[]>;
 
 function stripInternal(m: LocalMemory): Record<string, unknown> {
   const { deleted, source, ...rest } = m;
@@ -515,7 +586,22 @@ function applyLocalWrite(store: Store, req: ClassifiedRequest): Record<string, u
       }
       const memory = contents.join("\n") || "(empty)";
       const id = `local-${randomUUID()}`;
-      store.memories[id] = { id, memory, created_at: now, updated_at: now, source: "local", addPayload };
+      // The same bound harvest applies, applied here too. A 250,819-character add
+      // payload reached the store through this path, then failed every upload
+      // (mem0 rejected it with HTTP 400) and every embedding request.
+      const clamped = clampMemory(memory, id);
+      store.memories[id] = {
+        id,
+        memory: clamped.text,
+        created_at: now,
+        updated_at: now,
+        source: "local",
+        // The replay payload carries the clamped text, so the upload mem0 accepts
+        // matches what the mirror holds.
+        addPayload: { ...addPayload, memory: clamped.text, messages: undefined },
+        ...(clamped.overflow ? { overflow: clamped.overflow } : {}),
+      } as LocalMemory;
+      if (clamped.overflow) store.stats.harvestDropped = (store.stats.harvestDropped ?? 0) + 1;
       return { message: "Memory stored locally (mem0 API unavailable).", id, status: "PENDING" };
     }
     case "write-update": {
@@ -642,6 +728,16 @@ export interface ShadowEntry {
   overlapFusion5?: number;
   overlapFusion10?: number;
   mrrFusion?: number;
+  /** Dense-only ranking side: the shipped default's retrieval stage. */
+  localDense?: string[];
+  overlapDense5?: number;
+  overlapDense10?: number;
+  mrrDense?: number;
+  /** Dense followed by the reranker: the shipped default end to end. */
+  localDenseRerank?: string[];
+  overlapDenseRerank5?: number;
+  overlapDenseRerank10?: number;
+  mrrDenseRerank?: number;
   /** Query terms BM25 found nowhere in the corpus — a vocabulary-gap signal
    *  that separates "no lexical signal" from "lexical signal misranked". */
   unmatched?: string[];
@@ -668,41 +764,67 @@ export function compareShadow(
 export interface ShadowSummary {
   comparisons: number;
   fallbacks: number;
+  /** Legacy keyword scorer (the `local` field). */
   meanOverlap5: number;
   meanOverlap10: number;
   meanMrr: number;
   perfect5Rate: number;
   top1Recall: number;
-  vecComparisons: number;
-  meanOverlapVec5: number;
-  meanOverlapVec10: number;
-  meanMrrVec: number;
-  top1VecRecall: number;
-  bm25Comparisons: number;
-  meanOverlapBm25_5: number;
-  meanOverlapBm25_10: number;
-  meanMrrBm25: number;
-  fusionComparisons: number;
-  meanOverlapFusion5: number;
-  meanOverlapFusion10: number;
-  meanMrrFusion: number;
-  top1FusionRecall: number;
+  /** Per-strategy rows, keyed by strategy name. Each carries its own comparison
+   *  count, since a strategy that could not run on an entry is excluded rather
+   *  than counted as zero. */
+  strategies: Record<string, StrategySummary>;
+}
+
+export interface StrategySummary {
+  comparisons: number;
+  meanOverlap5: number;
+  meanOverlap10: number;
+  meanMrr: number;
+  top1Rate: number;
+}
+
+/** How to read one strategy out of a shadow entry. Adding a strategy to the
+ *  comparison table means adding a row here. */
+const STRATEGY_ROWS: { name: string; ids: (e: ShadowEntry) => string[] | undefined; mrr: (e: ShadowEntry) => number | undefined }[] = [
+  { name: "legacy", ids: (e) => e.local.map((h) => h.id), mrr: (e) => e.mrr },
+  { name: "remote", ids: (e) => e.remote.map((h) => h.id), mrr: () => 1 },
+  {
+    name: "bm25",
+    ids: (e) => e.localBm25?.map((h) => h.id),
+    mrr: (e) => e.mrrBm25,
+  },
+  { name: "dense", ids: (e) => e.localDense ?? e.localVec?.map((h) => h.id), mrr: (e) => e.mrrDense ?? e.mrrVec },
+  { name: "fusion", ids: (e) => e.localFusion, mrr: (e) => e.mrrFusion },
+  { name: "dense+rerank", ids: (e) => e.localDenseRerank, mrr: (e) => e.mrrDenseRerank },
+];
+
+/** Summarise one strategy over the entries where it produced a ranking. */
+function summarizeStrategy(remote: ShadowEntry[], row: (typeof STRATEGY_ROWS)[number]): StrategySummary {
+  const eligible = remote.filter((e) => row.mrr(e) !== undefined);
+  const n = eligible.length;
+  const mean = (pick: (e: ShadowEntry) => number) => (n === 0 ? 0 : eligible.reduce((s, e) => s + pick(e), 0) / n);
+  return {
+    comparisons: n,
+    // Derived from the recorded id list against remote's own list, so a
+    // strategy's overlap is recomputable from the log alone.
+    meanOverlap5: mean((e) => overlapWithRemote(row.ids(e) ?? [], e, 5)),
+    meanOverlap10: mean((e) => overlapWithRemote(row.ids(e) ?? [], e, 10)),
+    meanMrr: mean((e) => row.mrr(e) ?? 0),
+    top1Rate: n === 0 ? 0 : eligible.filter((e) => (row.mrr(e) ?? 0) > 0).length / n,
+  };
+}
+
+/** How many of the strategy's top-N ids appear in remote's list. */
+function overlapWithRemote(ids: string[], entry: ShadowEntry, n: number): number {
+  const remoteIds = new Set(entry.remote.map((h) => h.id));
+  return ids.slice(0, n).filter((id) => remoteIds.has(id)).length;
 }
 
 export function summarizeShadow(entries: ShadowEntry[]): ShadowSummary {
   const remote = entries.filter((e) => e.mode === "remote");
   const n = remote.length;
   const mean = (pick: (e: ShadowEntry) => number) => (n === 0 ? 0 : remote.reduce((sum, e) => sum + pick(e), 0) / n);
-  const withVec = remote.filter((e) => e.localVec !== undefined);
-  const nv = withVec.length;
-  const meanVec = (pick: (e: ShadowEntry) => number) => (nv === 0 ? 0 : withVec.reduce((sum, e) => sum + pick(e), 0) / nv);
-  const withBm25 = remote.filter((e) => e.mrrBm25 !== undefined);
-  const nb = withBm25.length;
-  const meanBm25 = (pick: (e: ShadowEntry) => number) => (nb === 0 ? 0 : withBm25.reduce((sum, e) => sum + pick(e), 0) / nb);
-  const withFusion = remote.filter((e) => e.mrrFusion !== undefined);
-  const nfu = withFusion.length;
-  const meanFusion = (pick: (e: ShadowEntry) => number) =>
-    nfu === 0 ? 0 : withFusion.reduce((sum, e) => sum + pick(e), 0) / nfu;
   return {
     comparisons: n,
     fallbacks: entries.length - n,
@@ -711,28 +833,8 @@ export function summarizeShadow(entries: ShadowEntry[]): ShadowSummary {
     meanMrr: mean((e) => e.mrr),
     perfect5Rate: n === 0 ? 0 : remote.filter((e) => e.overlap5 >= 5).length / n,
     top1Recall: n === 0 ? 0 : remote.filter((e) => e.mrr > 0).length / n,
-    vecComparisons: nv,
-    meanOverlapVec5: meanVec((e) => e.overlapVec5 ?? 0),
-    meanOverlapVec10: meanVec((e) => e.overlapVec10 ?? 0),
-    meanMrrVec: meanVec((e) => e.mrrVec ?? 0),
-    top1VecRecall: nv === 0 ? 0 : withVec.filter((e) => (e.mrrVec ?? 0) > 0).length / nv,
-    bm25Comparisons: nb,
-    meanOverlapBm25_5: meanBm25((e) => e.overlapBm25_5 ?? 0),
-    meanOverlapBm25_10: meanBm25((e) => e.overlapBm25_10 ?? 0),
-    meanMrrBm25: meanBm25((e) => e.mrrBm25 ?? 0),
-    fusionComparisons: nfu,
-    meanOverlapFusion5: meanFusion((e) => e.overlapFusion5 ?? 0),
-    meanOverlapFusion10: meanFusion((e) => e.overlapFusion10 ?? 0),
-    meanMrrFusion: meanFusion((e) => e.mrrFusion ?? 0),
-    top1FusionRecall: nfu === 0 ? 0 : withFusion.filter((e) => (e.mrrFusion ?? 0) > 0).length / nfu,
+    strategies: Object.fromEntries(STRATEGY_ROWS.map((row) => [row.name, summarizeStrategy(remote, row)])),
   };
-}
-
-/** Fraction of comparisons where the given MRR field equals 1 (top-1 exact). */
-function top1RateOf(entries: ShadowEntry[], field: keyof ShadowEntry): number {
-  const vals = entries.filter((e) => e.mode === "remote" && typeof e[field] === "number");
-  if (vals.length === 0) return 0;
-  return vals.filter((e) => e[field] === 1).length / vals.length;
 }
 
 /** Append one entry, then compact the file once it exceeds rotateBytes,
@@ -816,6 +918,11 @@ async function recordShadow(
   remoteBody: string | null,
   store: Store,
   embed?: EmbedHarness,
+  /// Recorded alongside the other strategies so the shipped default's rerank
+  /// stage is measured on live traffic. Absent means the dense+rerank side is
+  /// simply not logged for this entry.
+  reranker?: Reranker,
+  lexicalWeight: number = LEXICAL_WEIGHT_DEFAULT,
 ): Promise<void> {
   const remote = remoteSearchHits(remoteBody);
   const query = req.query ?? "";
@@ -856,13 +963,17 @@ async function recordShadow(
     entry.unmatched = lexicalChannel.unmatched(query).slice(0, 10);
   }
 
-  // Fused (and reranked, when configured) ranking — what the fusion strategy
-  // would have served. Recorded as ids so it survives any later scorer change.
+  // Fused ranking — what the fusion strategy would have served. Recorded as ids
+  // so it survives any later scorer change.
+  const denseDocs = embed ? Object.values(store.memories).filter((m) => !m.deleted && matchesScope(m, scope)) : [];
   if (embed) {
     try {
       const result = await recall({
         query,
-        channels: [new LexicalChannel({ docs: scopedDocs() }), new EmbedHarnessChannel(embed, Object.values(store.memories).filter((m) => !m.deleted && matchesScope(m, scope)))],
+        channels: [
+          new LexicalChannel({ docs: scopedDocs(), weight: lexicalWeight }),
+          new EmbedHarnessChannel(embed, denseDocs),
+        ],
         perChannelLimit: 50,
         fusedLimit: 10,
       });
@@ -883,6 +994,56 @@ async function recordShadow(
       }
     } catch (err) {
       entry.channelErrors = { fusion: err instanceof Error ? err.message : String(err) };
+    }
+  }
+
+  // The shipped default's own pipeline: dense alone, and dense reranked. Recorded
+  // separately from fusion so the ladder's stages can be compared on live traffic
+  // rather than only on the frozen gold set.
+  if (embed) {
+    try {
+      const denseText = new Map(denseDocs.map((m) => [m.id, m.memory]));
+      const denseOnly = await recall({
+        query,
+        channels: [new EmbedHarnessChannel(embed, denseDocs)],
+        perChannelLimit: 50,
+        fusedLimit: 10,
+      });
+      const denseIds = denseOnly.hits.map((h) => h.id);
+      if (denseIds.length > 0) {
+        const d = compareShadow(
+          denseIds.map((id) => ({ id })),
+          remote,
+        );
+        entry.localDense = denseIds;
+        entry.overlapDense5 = d.overlap5;
+        entry.overlapDense10 = d.overlap10;
+        entry.mrrDense = d.mrr;
+      }
+
+      if (reranker) {
+        const rr = await recall({
+          query,
+          channels: [new EmbedHarnessChannel(embed, denseDocs)],
+          perChannelLimit: 50,
+          fusedLimit: 10,
+          documentText: (id) => denseText.get(id) ?? "",
+          reranker: (q, c, textOf) => reranker(q, c, textOf),
+        });
+        const rrIds = rr.hits.map((h) => h.id);
+        if (rrIds.length > 0) {
+          const d = compareShadow(
+            rrIds.map((id) => ({ id })),
+            remote,
+          );
+          entry.localDenseRerank = rrIds;
+          entry.overlapDenseRerank5 = d.overlap5;
+          entry.overlapDenseRerank10 = d.overlap10;
+          entry.mrrDenseRerank = d.mrr;
+        }
+      }
+    } catch (err) {
+      entry.channelErrors = { ...(entry.channelErrors ?? {}), dense: err instanceof Error ? err.message : String(err) };
     }
   }
 
@@ -916,11 +1077,15 @@ export interface VectorStore {
   model: string;
   dims: number;
   vectors: Record<string, VectorRecord>;
+  /** Set once vectors are unit-length. Absent on older sidecars, which is what
+   *  triggers the migration in ensureEmbeddings. */
+  normalized?: boolean;
   updatedAt?: number;
 }
 
 export function emptyVectorStore(): VectorStore {
-  return { model: "", dims: 0, vectors: {} };
+  // normalized: true — an empty store has nothing left to convert.
+  return { model: "", dims: 0, vectors: {}, normalized: true };
 }
 
 export function loadVectorStore(path: string): VectorStore {
@@ -931,6 +1096,10 @@ export function loadVectorStore(path: string): VectorStore {
       model: typeof parsed.model === "string" ? parsed.model : "",
       dims: typeof parsed.dims === "number" ? parsed.dims : 0,
       vectors: parsed.vectors ?? {},
+      // Absent on a sidecar written before vectors were normalised at write time,
+      // which is the signal ensureEmbeddings uses to run the migration.
+      ...(parsed.normalized === true ? { normalized: true } : {}),
+      ...(typeof parsed.updatedAt === "number" ? { updatedAt: parsed.updatedAt } : {}),
     };
   } catch {
     return emptyVectorStore();
@@ -992,20 +1161,30 @@ export interface OpenAiCompatEmbedderOptions {
   label?: string;
   fetchImpl?: typeof fetch;
   timeoutMs?: number;
+  /** Per-input character cap; see createOpenAiCompatEmbedder. */
+  maxInputChars?: number;
 }
 
 export function createOpenAiCompatEmbedder(opts: OpenAiCompatEmbedderOptions): Embedder {
   const fetchImpl = opts.fetchImpl ?? ((...args: Parameters<typeof fetch>) => globalThis.fetch(...args));
   const label = opts.label ?? "embeddings";
-  const timeoutMs = opts.timeoutMs ?? 15_000;
+  // 45s rather than 15s: an 8B embedding model over a batch of long CJK memories
+  // takes materially longer than the 239M model the old default was tuned for.
+  const timeoutMs = opts.timeoutMs ?? 45_000;
+  // Per-input character cap. The provider rejects an oversized input with HTTP
+  // 400 and the whole batch fails, so a single long memory could stall the layer
+  // permanently. Truncating here means the worst case is a poorer embedding for
+  // one memory rather than no embeddings for any of them.
+  const maxInputChars = opts.maxInputChars ?? 8000;
   return {
     model: opts.model,
     async embed(texts: string[]): Promise<number[][]> {
       if (texts.length === 0) return [];
+      const input = texts.map((t) => (t.length > maxInputChars ? t.slice(0, maxInputChars) : t));
       const res = await fetchImpl(opts.endpoint, {
         method: "POST",
         headers: { "content-type": "application/json", authorization: `Bearer ${opts.apiKey}` },
-        body: JSON.stringify({ model: opts.model, input: texts }),
+        body: JSON.stringify({ model: opts.model, input }),
         signal: AbortSignal.timeout(timeoutMs),
       });
       if (!res.ok) {
@@ -1034,10 +1213,10 @@ export function normalizeVec(v: number[]): number[] {
 }
 
 export function cosine(a: number[], b: number[]): number {
-  const an = normalizeVec(a);
-  const bn = normalizeVec(b);
+  // Assumes unit-normalised inputs; see normaliseVectorsBelow.
   let dot = 0;
-  for (let i = 0; i < Math.min(an.length, bn.length); i++) dot += an[i] * bn[i];
+  const n = Math.min(a.length, b.length);
+  for (let i = 0; i < n; i++) dot += a[i] * b[i];
   return dot;
 }
 
@@ -1047,28 +1226,91 @@ export function searchLocalVector(
   vectors: Record<string, VectorRecord>,
   limit = MAX_FALLBACK_RESULTS,
 ): { m: LocalMemory; score: number }[] {
-  return corpus
-    .map((m) => {
-      const v = vectors[m.id]?.vec;
-      return { m, score: v ? cosine(queryVec, v) : 0 };
-    })
-    .filter((s) => s.score > 0)
-    .sort((a, b) => b.score - a.score)
-    .slice(0, limit);
+  // The query vector is normalised once here; the corpus vectors were normalised
+  // when they were written. Normalising inside `cosine` meant re-normalising every
+  // 4096-dimension corpus vector on every query — about 18M redundant
+  // multiplications across a 4395-memory corpus, which is what made a dense read
+  // take seconds.
+  const q = normalizeVec(queryVec);
+  const scored: { m: LocalMemory; score: number }[] = [];
+  for (const m of corpus) {
+    const v = vectors[m.id]?.vec;
+    if (!v) continue;
+    const score = cosine(q, v);
+    if (score > 0) scored.push({ m, score });
+  }
+  scored.sort((a, b) => b.score - a.score);
+  return scored.slice(0, limit);
 }
 
 /** Embed corpus entries incrementally: new/changed texts only, stale vectors
  *  for deleted memories pruned, model mismatch wipes the store. Throws on
  *  provider failure — callers decide cooldown policy. */
+export interface EnsureProgress {
+  /** Texts embedded in this call. */
+  embedded: number;
+  /** Live memories in the corpus. */
+  corpus: number;
+  /** Batches that failed and were skipped; the next call retries them. */
+  failedBatches: number;
+  /** Targets still lacking a vector once this call finished. Zero means the
+   *  sidecar covers the corpus. */
+  remaining: number;
+  /** True when this call also converted the sidecar to unit-length vectors. */
+  migratedNormalization?: boolean;
+  /** First error seen, for the health report. */
+  firstError?: string;
+}
+
+/**
+ * Bring the vector sidecar up to date with the corpus.
+ *
+ * WHY THIS IS BATCH-WISE AND RESUMABLE
+ * The first version embedded every stale memory in chunks of 256 and wrote the
+ * sidecar once at the end. Two failures compounded: 256 x ~250 chars is roughly
+ * 18K tokens in one request, which exceeded the 15s per-request timeout, and the
+ * all-or-nothing write meant every timeout discarded the whole run. A 4386-memory
+ * corpus therefore never converged — the embedding layer reported 0 vectors on
+ * every call and the pipeline silently served BM25.
+ *
+ * Three changes fix it. Batches are small enough to finish inside the timeout. Each
+ * successful batch is persisted immediately, so progress survives a later failure.
+ * A failed batch is recorded and skipped rather than aborting the run, so one
+ * oversized memory cannot block the other 4385.
+ *
+ * A fourth change bounds the call. A full 4386-memory backfill at ~9s per batch is
+ * roughly ten minutes of wall time, and the first version ran all of it inside one
+ * `await` — long enough to block a session, and long enough to be killed by a
+ * caller with its own deadline. `maxBatches` caps the work per call: each call
+ * advances coverage by a bounded amount and the next call resumes from the
+ * sidecar, so a large corpus converges over several calls while every call returns
+ * promptly.
+ */
 export async function ensureEmbeddings(
   store: Store,
   vecStore: VectorStore,
   embedder: Embedder,
-): Promise<{ embedded: number; corpus: number }> {
+  opts: { save?: () => void; batchSize?: number; maxBatches?: number } = {},
+): Promise<EnsureProgress> {
+  const migratedNormalization = vecStore.normalized !== true;
   if (vecStore.model !== embedder.model) {
     vecStore.vectors = {};
     vecStore.model = embedder.model;
     vecStore.dims = 0;
+  }
+  // One-time migration to unit-length vectors. An earlier version stored raw
+  // provider output and normalised inside `cosine`, which re-normalised every
+  // corpus vector on every query. Detecting it by measuring one vector costs a few
+  // thousand multiplications once; normalising inside the comparison cost about
+  // 18M per query.
+  let migrated = 0;
+  if (vecStore.normalized !== true) {
+    for (const rec of Object.values(vecStore.vectors)) {
+      if (rec.vec?.length) rec.vec = normalizeVec(rec.vec);
+      migrated++;
+    }
+    vecStore.normalized = true;
+    if (migrated > 0) opts.save?.();
   }
   const live = Object.values(store.memories).filter((m) => !m.deleted);
   const targets = live.filter((m) => {
@@ -1079,20 +1321,61 @@ export async function ensureEmbeddings(
     const m = store.memories[id];
     if (!m || m.deleted) delete vecStore.vectors[id];
   }
-  if (targets.length === 0) return { embedded: 0, corpus: live.length };
-  // Chunked embedding: thousands of inputs in one request would blow the
-  // per-request timeout; 256 inputs per call stays fast and well under limits.
-  const vecs: number[][] = [];
-  const CHUNK = 256;
-  for (let i = 0; i < targets.length; i += CHUNK) {
-    vecs.push(...(await embedder.embed(targets.slice(i, i + CHUNK).map((m) => m.memory))));
+  const remaining = targets.length;
+  if (remaining === 0) {
+    return { embedded: 0, corpus: live.length, failedBatches: 0, remaining: 0, migratedNormalization };
   }
-  targets.forEach((m, i) => {
-    vecStore.vectors[m.id] = { hash: textHash(m.memory), vec: vecs[i] };
-  });
-  vecStore.dims = vecs[0]?.length ?? 0;
-  vecStore.updatedAt = Date.now();
-  return { embedded: targets.length, corpus: live.length };
+
+  const batchSize = opts.batchSize ?? EMBED_BATCH_SIZE;
+  const maxBatches = opts.maxBatches ?? EMBED_MAX_BATCHES_PER_CALL;
+  let embedded = 0;
+  let failedBatches = 0;
+  let firstError: string | undefined;
+
+  // Group by input count and character budget, whichever trips first.
+  const batches: LocalMemory[][] = [];
+  for (const m of targets) {
+    const current = batches[batches.length - 1];
+    const currentChars = current ? current.reduce((s, x) => s + x.memory.length, 0) : 0;
+    if (!current || current.length >= batchSize || currentChars + m.memory.length > EMBED_BATCH_CHARS) {
+      batches.push([m]);
+    } else {
+      current.push(m);
+    }
+  }
+
+  const todo = batches.slice(0, maxBatches);
+  for (let i = 0; i < todo.length; i++) {
+    const batch = todo[i];
+    try {
+      const vecs = await embedder.embed(batch.map((m) => m.memory));
+      batch.forEach((m, j) => {
+        // Normalise at write time so a lookup is a plain dot product: the corpus
+        // vectors are read far more often than they are written.
+        vecStore.vectors[m.id] = { hash: textHash(m.memory), vec: normalizeVec(vecs[j]) };
+      });
+      vecStore.dims = vecs[0]?.length ?? vecStore.dims;
+      vecStore.updatedAt = Date.now();
+      embedded += batch.length;
+      // Persist per batch: a later timeout must not discard completed work.
+      opts.save?.();
+    } catch (err) {
+      failedBatches++;
+      firstError = firstError ?? (err instanceof Error ? err.message : String(err));
+      // Back off after a failure: a burst of failed batches usually means the
+      // provider is rate limiting, and retrying immediately deepens it.
+      await new Promise((r) => setTimeout(r, 500));
+    }
+  }
+
+  return {
+    embedded,
+    corpus: live.length,
+    failedBatches,
+    remaining: remaining - embedded,
+    migratedNormalization,
+    ...(firstError ? { firstError } : {}),
+  };
 }
 
 /** Interceptor-facing embedding harness: never throws, answers null when the
@@ -1101,7 +1384,15 @@ export interface EmbedHarness {
   ensure(): Promise<void>;
   /** Vector ranking for one query, or null when unavailable. */
   search(query: string): Promise<{ m: LocalMemory; score: number }[] | null>;
-  status(): { enabled: boolean; model: string; vectors: number; corpus: number; lastError?: string; cooldownUntil?: number };
+  status(): {
+    enabled: boolean;
+    model: string;
+    vectors: number;
+    corpus: number;
+    lastError?: string;
+    lastProgress?: { embedded: number; failedBatches: number; remaining: number };
+    cooldownUntil?: number;
+  };
   /** Force a full re-embed; returns a human-readable result line. */
   refresh(): Promise<string>;
 }
@@ -1119,14 +1410,32 @@ export function createEmbedHarness(
     cooldownUntil = Date.now() + EMBED_COOLDOWN_MS;
   };
   let ensurePromise: Promise<void> | null = null;
+  /** Coverage reached by the last ensure, for the status report. */
+  let lastProgress: { embedded: number; failedBatches: number; remaining: number } | undefined;
   const ensure = (): Promise<void> => {
+    // One in-flight backfill at a time: onPassthroughSuccess fires on every
+    // successful mem0 call, and overlapping runs would re-embed the same targets.
     if (ensurePromise) return ensurePromise;
     ensurePromise = (async () => {
       if (Date.now() < cooldownUntil) return;
       try {
-        const r = await ensureEmbeddings(store, vecStore, embedder);
-        if (r.embedded > 0) saveVectors();
-        lastError = undefined;
+        const r = await ensureEmbeddings(store, vecStore, embedder, { save: saveVectors });
+        lastProgress = { embedded: r.embedded, failedBatches: r.failedBatches, remaining: r.remaining };
+        // Partial success is the normal path while a large corpus backfills, so a
+        // few failed batches are recorded rather than treated as a dead layer.
+        lastError = r.failedBatches > 0 ? `${r.failedBatches} batch(es) failed: ${r.firstError ?? "unknown"}` : undefined;
+        // Keep going in the background while coverage is incomplete: each call is
+        // bounded, so a large first backfill finishes over several rounds instead
+        // of holding a session open for ten minutes. `void` because the search that
+        // triggered this must not wait for the whole corpus.
+        if (r.remaining > 0 && r.failedBatches === 0) {
+          void (async () => {
+            // Yield first so the caller's own await resolves with partial coverage
+            // available rather than after another full round.
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            if (ensurePromise === null) void ensure();
+          })();
+        }
       } catch (err) {
         fail(err);
       }
@@ -1149,11 +1458,17 @@ export function createEmbedHarness(
     }
   };
   const status = () => ({
-    enabled: true,
+    // Enabled means the layer can be asked for a ranking, not that vectors are
+    // already on disk: the first search triggers the backfill. Reporting
+    // enabled=false on an empty sidecar would route every read to BM25 for the
+    // whole first backfill. A failed call or an active cooldown is what disables
+    // it, and `search()` returns null when the corpus genuinely has no vectors.
+    enabled: Date.now() >= cooldownUntil && lastError === undefined,
     model: embedder.model,
     vectors: Object.keys(vecStore.vectors).length,
     corpus: Object.values(store.memories).filter((m) => !m.deleted).length,
     lastError,
+    lastProgress,
     cooldownUntil: cooldownUntil > Date.now() ? cooldownUntil : undefined,
   });
   const refresh = async (): Promise<string> => {
@@ -1298,25 +1613,33 @@ export interface InterceptorOptions {
    *  traffic without changing what the agent sees mid-session. */
   localStrategy?: LocalStrategy;
   /** Cross-encoder reranking of the fused pool. Enabled with the
-   *  "fusion+rerank" strategy; absent means that strategy degrades to fusion. */
+   *  "fusion+rerank" and "dense+rerank" strategies; absent means those degrade. */
   reranker?: Reranker;
+  /** Fusion weight for the lexical channel; see LEXICAL_WEIGHT_DEFAULT. */
+  lexicalWeight?: number;
   /** Enable per-strategy shadow comparison on every read-search miss. */
   testMode?: boolean;
 }
 
 /** How a local (non-network) search read is answered. */
 export type LocalStrategy =
+  /** Resolve the best available pipeline from the measured preference ladder.
+   *  The default: dense+rerank when both work, dense when only embeddings work,
+   *  bm25 when no provider is available. */
+  | "auto"
   /** Legacy single-character keyword scorer. Kept for A/B and fallback. */
   | "legacy"
-  /** BM25 + CJK bigram only. */
+  /** BM25 + CJK bigram only. The availability floor: needs no provider. */
   | "bm25"
   /** Embedding cosine only (whatever the embed harness provides). */
   | "dense"
-  /** BM25 + dense fused with RRF. The default. */
+  /** BM25 + dense fused with RRF, the lexical side down-weighted. */
   | "fusion"
-  /** Fusion, then the reranker reorders the pool. Enabled once a reranker is
-   *  configured; falls back to "fusion" when none is. */
-  | "fusion+rerank";
+  /** Fusion, then the reranker reorders the pool. */
+  | "fusion+rerank"
+  /** Dense, then the reranker reorders the pool. Measured joint-best with
+   *  fusion+rerank, and the simpler pipeline of the two. */
+  | "dense+rerank";
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -1342,6 +1665,7 @@ export function createInterceptor(
           embed: opts.embed,
           localStrategy: opts.localStrategy,
           reranker: opts.reranker,
+          lexicalWeight: opts.lexicalWeight,
           scope: extractScope(req.bodyText, req.search),
           onStrategy: (info) => {
             store.stats.lastStrategy = info.strategy;
@@ -1477,7 +1801,7 @@ export function createInterceptor(
       if (res.ok) {
         const body = await res.clone().text();
         if (req.kind === "read-search" && opts.shadowLog) {
-          await recordShadow(opts.shadowLog, "remote", req, body, store, opts.embed);
+          await recordShadow(opts.shadowLog, "remote", req, body, store, opts.embed, opts.reranker, opts.lexicalWeight);
         }
         store.cache[key] = { status: res.status, body, savedAt: Date.now() };
         harvestMemories(store, body);
@@ -1512,7 +1836,7 @@ export function createInterceptor(
     const localAnswer = await serveLocalRead(req);
     if (localAnswer) {
       if (req.kind === "read-search" && opts.shadowLog) {
-        await recordShadow(opts.shadowLog, "fallback", req, null, store, opts.embed);
+        await recordShadow(opts.shadowLog, "fallback", req, null, store, opts.embed, opts.reranker, opts.lexicalWeight);
       }
       save();
       return localAnswer;
@@ -1809,8 +2133,15 @@ export function resolveProviderKey(provider: string): string | undefined {
 
 /** Parse a strategy name from env, ignoring unknown values. */
 export function readStrategy(value: string | undefined): LocalStrategy | undefined {
-  const known: LocalStrategy[] = ["legacy", "bm25", "dense", "fusion", "fusion+rerank"];
-  return value && (known as string[]).includes(value) ? (value as LocalStrategy) : undefined;
+  return parseStrategy(value) as LocalStrategy | undefined;
+}
+
+/** Fusion weight for the lexical channel, from MEM0_FUSION_BM25_WEIGHT.
+ *  1 restores equal weighting; the default is the gold-set-derived value. */
+export function readLexicalWeight(value: string | undefined): number {
+  if (value === undefined || value === "") return LEXICAL_WEIGHT_DEFAULT;
+  const n = Number(value);
+  return Number.isFinite(n) && n >= 0 ? n : LEXICAL_WEIGHT_DEFAULT;
 }
 
 export default function piMem0Cache(pi: ExtensionAPI): void {
@@ -1829,6 +2160,9 @@ export default function piMem0Cache(pi: ExtensionAPI): void {
   const saveVectors = makeVectorSaver(vecStore, vectorsPath);
   const embedder = createDefaultEmbedder();
   const embed = embedder ? createEmbedHarness(store, saveVectors, vecStore, embedder) : undefined;
+  // A missing reranker is a supported state: the fusion strategy still answers,
+  // and only "fusion+rerank" reports a degradation.
+  const reranker = createDefaultReranker(resolveProviderKey);
 
   // -- Test mode ------------------------------------------------------------
   // MEM0_RECALL_STRATEGY picks what answers local reads; MEM0_RECALL_TEST=1
@@ -1837,6 +2171,7 @@ export default function piMem0Cache(pi: ExtensionAPI): void {
   // against the same remote ground truth. Test mode changes what is measured,
   // never what the agent receives.
   const localStrategy = readStrategy(process.env.MEM0_RECALL_STRATEGY);
+  const lexicalWeight = readLexicalWeight(process.env.MEM0_FUSION_BM25_WEIGHT);
   const testMode = process.env.MEM0_RECALL_TEST === "1" || localStrategy !== undefined;
 
   const g = globalThis as { fetch?: typeof fetch & { [WRAPPED]?: boolean } };
@@ -1867,6 +2202,8 @@ export default function piMem0Cache(pi: ExtensionAPI): void {
       embed,
       filtersRef,
       localStrategy,
+      reranker,
+      lexicalWeight,
       testMode,
       onFallback: (reason) => console.warn(`[pi-mem0-cache] ${reason}`),
       onPassthroughSuccess: () => {
@@ -1931,44 +2268,23 @@ export default function piMem0Cache(pi: ExtensionAPI): void {
           const s = summarizeShadow(entries);
           // Strategy comparison table, best-first on MRR. Every column is scored
           // against the same remote ground truth, so they are directly comparable.
-          const rows: { name: string; n: number; o5: number; o10: number; mrr: number; top1: number }[] = [
-            { name: "legacy", n: s.comparisons, o5: s.meanOverlap5, o10: s.meanOverlap10, mrr: s.meanMrr, top1: s.top1Recall },
-          ];
-          if (s.bm25Comparisons > 0) {
-            rows.push({
-              name: "bm25",
-              n: s.bm25Comparisons,
-              o5: s.meanOverlapBm25_5,
-              o10: s.meanOverlapBm25_10,
-              mrr: s.meanMrrBm25,
-              top1: s.bm25Comparisons === 0 ? 0 : top1RateOf(entries, "mrrBm25"),
-            });
-          }
-          if (s.vecComparisons > 0) {
-            rows.push({
-              name: "dense",
-              n: s.vecComparisons,
-              o5: s.meanOverlapVec5,
-              o10: s.meanOverlapVec10,
-              mrr: s.meanMrrVec,
-              top1: s.top1VecRecall,
-            });
-          }
-          if (s.fusionComparisons > 0) {
-            rows.push({
-              name: "fusion",
-              n: s.fusionComparisons,
-              o5: s.meanOverlapFusion5,
-              o10: s.meanOverlapFusion10,
-              mrr: s.meanMrrFusion,
-              top1: s.top1FusionRecall,
-            });
-          }
+          // Rows come from the summary map, so adding a strategy to STRATEGY_ROWS
+          // is enough to make it appear here.
+          const rows = Object.entries(s.strategies)
+            .filter(([, v]) => v.comparisons > 0)
+            .map(([name, v]) => ({
+              name,
+              n: v.comparisons,
+              o5: v.meanOverlap5,
+              o10: v.meanOverlap10,
+              mrr: v.meanMrr,
+              top1: v.top1Rate,
+            }));
           const table = rows
             .sort((a, b) => b.mrr - a.mrr)
             .map(
               (r) =>
-                `${r.name.padEnd(7)} n=${String(r.n).padStart(4)}  o@5 ${r.o5.toFixed(2)}  o@10 ${r.o10.toFixed(2)}  MRR ${r.mrr.toFixed(3)}  top1 ${(r.top1 * 100).toFixed(0)}%`,
+                `${r.name.padEnd(13)} n=${String(r.n).padStart(4)}  o@5 ${r.o5.toFixed(2)}  o@10 ${r.o10.toFixed(2)}  MRR ${r.mrr.toFixed(3)}  top1 ${(r.top1 * 100).toFixed(0)}%`,
             )
             .join("\n");
           let msg = `mem0-cache shadow: ${s.comparisons} comparisons (${s.fallbacks} fallback)\n${table}`;
@@ -2006,7 +2322,27 @@ export default function piMem0Cache(pi: ExtensionAPI): void {
           }
           const active = embedder ? `${embedder.model}` : "none (local reads use BM25 only)";
           lines.push(``, `active embedder: ${active}`);
-          lines.push(`serving strategy: ${localStrategy ?? "fusion (default)"}`);
+
+          // Show the resolution, not just the request: the operator's question is
+          // "what is answering my reads", and the answer is a plan plus whatever
+          // was skipped to reach it.
+          const caps = {
+            dense: embed !== undefined && embed.status().enabled,
+            rerank: reranker !== undefined,
+          };
+          const res = resolveStrategy(localStrategy ?? "auto", caps);
+          const ndcg = res.plan.measuredNdcg === null ? "unmeasured" : `nDCG@10 ${res.plan.measuredNdcg.toFixed(3)}`;
+          lines.push(`requested strategy: ${localStrategy ?? "auto (default)"}`);
+          lines.push(`serving strategy:   ${res.plan.strategy}  (${res.plan.summary}; ${ndcg})`);
+          for (const s of res.skipped) {
+            lines.push(`  skipped ${s.strategy.padEnd(14)} ${s.reason}`);
+          }
+          lines.push(
+            `capabilities:       embed ${caps.dense ? "ok" : "off"} | rerank ${caps.rerank ? "ok" : "off"}`,
+          );
+          lines.push(
+            `providers:          openrouter ${resolveProviderKey("openrouter") ? "key present" : "no key"}`,
+          );
           lines.push(`test mode: ${testMode ? "on" : "off"}`);
           if (embed) {
             const s = embed.status();

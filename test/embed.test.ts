@@ -73,9 +73,24 @@ describe("createJinaEmbedder", () => {
 });
 
 describe("cosine / searchLocalVector", () => {
-  it("scores identical directions 1 and orthogonal 0", () => {
-    expect(cosine([1, 0], [2, 0])).toBeCloseTo(1);
-    expect(cosine([1, 0], [0, 3])).toBeCloseTo(0);
+  it("is a plain dot product over unit-length inputs", () => {
+    // The contract: inputs are unit-length, which is what the write path
+    // guarantees. `searchLocalVector` normalises the query, so callers never
+    // normalise anything themselves.
+    expect(cosine([1, 0], [1, 0])).toBeCloseTo(1);
+    expect(cosine([1, 0], [0, 1])).toBeCloseTo(0);
+    // A non-unit vector is treated as-is rather than rescaled: normalising here is
+    // exactly the cost this function was changed to avoid.
+    expect(cosine([1, 0], [2, 0])).toBeCloseTo(2);
+  });
+
+  it("normalises the query before scoring, so magnitude does not affect ranking", () => {
+    const store = storeWith(mem("a", "alpha"), mem("b", "beta"));
+    const vectors = { a: { hash: "h", vec: [1, 0] }, b: { hash: "h", vec: [0.6, 0.8] } };
+    const corpus = [store.memories.a, store.memories.b];
+    const scaled = searchLocalVector([10, 0], corpus, vectors, 10);
+    const plain = searchLocalVector([1, 0], corpus, vectors, 10);
+    expect(scaled.map((r) => r.m.id)).toEqual(plain.map((r) => r.m.id));
   });
 
   it("ranks corpus by similarity", () => {
@@ -107,19 +122,19 @@ describe("ensureEmbeddings", () => {
     const store = storeWith(mem("a", "alpha"), mem("b", "beta"));
     const vecStore = emptyVectorStore();
     const r1 = await ensureEmbeddings(store, vecStore, embedder);
-    expect(r1).toEqual({ embedded: 2, corpus: 2 });
+    expect(r1).toMatchObject({ embedded: 2, corpus: 2, failedBatches: 0 });
     expect(vecStore.dims).toBe(2);
 
     // one new memory + one changed text → one batch with exactly those two targets
     store.memories.c = mem("c", "gamma");
     store.memories.b.memory = "beta changed";
     const r2 = await ensureEmbeddings(store, vecStore, embedder);
-    expect(r2).toEqual({ embedded: 2, corpus: 3 });
+    expect(r2).toMatchObject({ embedded: 2, corpus: 3, failedBatches: 0 });
     expect(batches[1]).toEqual(["beta changed", "gamma"]); // targets recorded by text
 
     // unchanged corpus → no API call
     const r3 = await ensureEmbeddings(store, vecStore, embedder);
-    expect(r3).toEqual({ embedded: 0, corpus: 3 });
+    expect(r3).toMatchObject({ embedded: 0, corpus: 3, failedBatches: 0 });
     expect(batches).toHaveLength(2);
 
     // deleted memory → vector pruned
@@ -276,22 +291,25 @@ describe("summarizeShadow with vector side", () => {
       { ts: 3, mode: "fallback", query: "q3", local: [{ id: "b", score: 1 }], remote: [], overlap5: 0, overlap10: 0, mrr: 0 },
     ];
     const s = summarizeShadow(entries);
-    expect(s).toMatchObject({
-      comparisons: 2,
-      fallbacks: 1,
-      vecComparisons: 1,
-      meanOverlapVec5: 1,
-      meanMrrVec: 1,
-      top1VecRecall: 1,
-    });
+    expect(s).toMatchObject({ comparisons: 2, fallbacks: 1 });
+    // The dense row is built from localVec when no separate dense ranking was
+    // recorded, and only counts the entries where it produced a ranking.
+    expect(s.strategies.dense).toMatchObject({ comparisons: 1, meanMrr: 1, top1Rate: 1 });
+    // legacy ran on both remote entries.
+    expect(s.strategies.legacy.comparisons).toBe(2);
+    // A strategy absent from every entry reports zero comparisons rather than a
+    // misleading 0.000 score over the full set.
+    for (const name of ["bm25", "fusion", "dense+rerank"]) {
+      expect(s.strategies[name].comparisons, name).toBe(0);
+    }
   });
 });
 
 describe("loadVectorStore", () => {
   it("tolerates missing and malformed files", () => {
-    expect(loadVectorStore(join(tmp, "missing-vectors.json"))).toEqual({ model: "", dims: 0, vectors: {} });
+    expect(loadVectorStore(join(tmp, "missing-vectors.json"))).toEqual({ model: "", dims: 0, vectors: {}, normalized: true });
     const bad = join(tmp, "bad-vectors.json");
     writeFileSync(bad, "{oops");
-    expect(loadVectorStore(bad)).toEqual({ model: "", dims: 0, vectors: {} });
+    expect(loadVectorStore(bad)).toEqual({ model: "", dims: 0, vectors: {}, normalized: true });
   });
 });

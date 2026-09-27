@@ -1,7 +1,7 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import piMem0Cache, { readShadowEntries } from "../src/index.ts";
 
 const SEARCH_URL = "https://api.mem0.ai/v3/memories/search/";
@@ -18,6 +18,16 @@ describe("extension entry shadow wiring", () => {
   afterEach(() => {
     globalThis.fetch = originalFetch;
     vi.unstubAllEnvs();
+  });
+
+  // Keep the suite hermetic. Without this the entry resolves a real OpenRouter
+  // key from the login keychain and the shadow comparison issues live rerank
+  // requests, which is both slow and dependent on network state. MEM0_EMBED=0
+  // additionally keeps the dense side from trying to reach a provider.
+  beforeEach(() => {
+    vi.stubEnv("MEM0_KEYCHAIN", "0");
+    vi.stubEnv("MEM0_EMBED", "0");
+    vi.stubEnv("MEM0_RERANK", "0");
   });
 
   it("wraps global fetch, logs shadow entries, and reports via /mem0-cache shadow", async () => {
@@ -58,5 +68,8 @@ describe("extension entry shadow wiring", () => {
     expect(message).toContain("legacy");
     expect(message).toContain("o@5");
     expect(message).toContain("MRR");
-  });
+    // The entry wraps global fetch and runs the shadow comparison over the whole
+    // corpus. Under the full suite's parallelism that work lands close to the 5s
+    // default and produced a flaky timeout, so this case claims its own budget.
+  }, 20_000);
 });

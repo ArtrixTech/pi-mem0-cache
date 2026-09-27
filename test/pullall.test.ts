@@ -8,6 +8,7 @@ import {
   createInterceptor,
   emptyStore,
   emptyVectorStore,
+  ensureEmbeddings,
   filtersFromCache,
   pullAllMemories,
   type CapturedAuth,
@@ -111,10 +112,40 @@ describe("ensureEmbeddings chunking", () => {
         return texts.map((t) => [1, 0]);
       },
     };
-    const harness = createEmbedHarness(store, () => {}, vecStore, embedder);
-    await harness.ensure();
+    let saves = 0;
+    await ensureEmbeddings(store, vecStore, embedder, { batchSize: 256, save: () => saves++ });
     expect(batchSizes).toEqual([256, 256, 88]);
     expect(Object.keys(vecStore.vectors)).toHaveLength(600);
+    // Every batch persists, so an interrupted backfill resumes from where it got
+    // to rather than starting over.
+    expect(saves).toBe(3);
+  });
+
+  it("keeps completed batches when one batch fails", async () => {
+    const store = makeStore();
+    for (let i = 0; i < 12; i++) store.memories[`m${i}`] = { id: `m${i}`, memory: `text ${i}`, created_at: "", updated_at: "", deleted: false, source: "observed" };
+    const vecStore = emptyVectorStore();
+    let call = 0;
+    const embedder: Embedder = {
+      model: "test",
+      embed: async (texts) => {
+        call++;
+        // The second of four batches times out; the run continues past it.
+        if (call === 2) throw new Error("timeout");
+        return texts.map(() => [1, 0]);
+      },
+    };
+    const r = await ensureEmbeddings(store, vecStore, embedder, { batchSize: 3 });
+    expect(r.failedBatches).toBe(1);
+    expect(r.firstError).toBe("timeout");
+    expect(r.embedded).toBe(9);
+    expect(Object.keys(vecStore.vectors)).toHaveLength(9);
+
+    // A second run retries only the batch that failed.
+    call = 0;
+    const r2 = await ensureEmbeddings(store, vecStore, embedder, { batchSize: 3 });
+    expect(r2.embedded).toBe(3);
+    expect(Object.keys(vecStore.vectors)).toHaveLength(12);
   });
 });
 
