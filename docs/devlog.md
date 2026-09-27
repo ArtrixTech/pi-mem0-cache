@@ -1,5 +1,86 @@
 # devlog
 
+## perf(embed): cache query vectors, separate transient failures from layer faults
+
+`d8e457c` | 2026-09-27
+
+- **Changes**: query embeddings cached in a bounded 256-entry map keyed by query text. `search` no longer routes a query-embedding failure into `fail()`; a new `errorKind` distinguishes transient (this query's embedding) from persistent (corpus backfill) faults, and only the persistent kind sets the 60s cooldown or reports `enabled: false`. `ensureEmbeddings` now returns `batches` alongside `failedBatches`, and the harness calls `fail()` when every attempted batch failed.
+- **Reason**: live measurement of a dense read showed 1.3-5.0s in the query embedding round trip against 39ms of local work (filter 4396 memories, intersect with vectors, score and sort 4096-dim vectors, 37ms). Two defects followed from one failure policy: a single query timeout disabled dense retrieval for a full minute (observed — a dense+rerank read timed out and the next three reads all degraded to bm25), and repeated identical queries re-paid the round trip.
+- **Process**: instrumented the live provider to separate query-embed latency (1.3s/4.9s/4.1s across three identical calls) from the local scan (37ms), which located the bottleneck outside the code. Traced why the cooldown never cleared: `ensureEmbeddings` catches per batch, so a run where all batches failed returned normally and `fail()` was never reached. TDD — 4 cases in test/embed.test.ts rewritten or added first; the existing "falls back to null on failure" case was itself mislabelled (it exercised the query path while asserting the corpus path).
+- **Result**: live suite 4/4 with zero degradation; file duration 74.6s -> 13.4s. dense 2196-3696ms, dense+rerank 1024-1786ms, fusion 28-42ms, bm25 7-14ms. 214 tests, typecheck clean.
+- **Notes**: `fusion` at 28ms reflects the query cache hitting on a repeat; a cold fusion read is bounded by one query embedding. The local scan is 37ms and is now the floor for a warm read.
+
+## feat(recall): weighted RRF, and document the measured pipeline
+
+`80231b0` | 2026-09-27
+
+- **Changes**: `fuseRrf` scales each channel by `weight/(K+rank)`; `LEXICAL_WEIGHT_DEFAULT = 0.4` (env `MEM0_FUSION_BM25_WEIGHT`, 1 restores equal weights). `fusion+rerank` degrades to `dense` rather than `fusion`. README rewritten around the staged pipeline, the resolution ladder with measured numbers, why BM25 left the serving path, the full-corpus eval commands, and an env/credentials table.
+- **Reason**: equal channel weighting assumes comparable information value, and on this corpus they are not comparable. A query about the term "waveterminal" produced ten BM25 candidates that all graded 0 while dense ranked a grade-2 memory first; the ten collected RRF points, three outscored the correct answer, and a correct top-1 became rank 5.
+- **Process**: traced the failure query rank-by-rank through the RRF accumulation (`bm25:4 dense:5` on three grade-0 memories above `dense:1` on a grade-2). Ran a weight sweep on the gold set: equal 0.564/0.590, x0.5 0.667, x0.3 0.666, adaptive 0.673, dense-only 0.694 — every weight beat equal, none reached single-channel dense, which is why BM25 left the serving path entirely rather than being down-weighted.
+- **Result**: fusion nDCG@10 0.590 -> 0.633. 212 tests, typecheck clean.
+- **Notes**: the sweep is reproducible via `scripts/score-full.mjs`; the weight is a corpus property, and a future corpus with different lexical characteristics deserves re-running the comparison.
+
+## feat(eval): full-corpus retrieval harness, gold-set scoring, reliable key entry
+
+`1752d04` | 2026-09-27
+
+- **Changes**: `scripts/retrieve-full.mjs` runs every strategy against the real in-scope corpus and returns each strategy's own top-K; the judged pool is the union of those top-Ks. `scripts/score-full.mjs` reports nDCG@10/R@10/P@5/MRR/hit@10/zero@10, optionally by query shape. `judge-gold.mjs` keeps a grade pool across gold files. `setup-key.sh` now delegates to `scripts/ask-secret.mjs`.
+- **Reason**: the first gold set scored each strategy over a ~19-candidate pool assembled from recorded top-10s, then had each strategy reorder that pool. That measures reordering, not retrieval, and it biased the result toward whichever retriever contributed the most candidates — measured 342 candidates appearing only in the remote list, 557 only in the local lists, 63 shared.
+- **Process**: probed the pool's source composition before trusting the numbers, which is what exposed the bias. Ran the full-corpus harness over 57 queries (mean 2570 in-scope memories) at $0.009, then judged 1576 pairs. Also reproduced the key-entry failure: `read -s -p ... </dev/tty` returned a single stray byte under the user's terminal wrapper and stored it silently, leaving a one-character key that failed every request.
+- **Result**: 57 queries / 1576 judgments. dense+rerank 0.821, fusion+rerank 0.821, dense 0.677, fusion 0.633, bm25 0.346, legacy 0.241. Grade pool reused 2247 labels, cutting 173 outstanding judgments to 16. 209 tests, typecheck clean.
+- **Notes**: `nDCG` against `R@10` is the diagnostic pair — R@10 says whether the answer was reachable, nDCG whether it was surfaced. The reranker equalises the fusion and dense pools (both 0.821), which is what justified dropping fusion from the serving path.
+
+## fix(embed): bound the backfill, persist per batch, cap inputs
+
+`7ccbf8f` | 2026-09-27
+
+- **Changes**: batches are 64 inputs or 16K chars (env `MEM0_EMBED_BATCH_SIZE`); each successful batch persists the sidecar immediately; a failed batch is recorded and skipped; calls are capped at 8 batches (env `MEM0_EMBED_MAX_BATCHES`) with the next call resuming from the sidecar. Local writes enforce the harvest size bound via a shared `clampMemory`. The embedder caps each input at 8000 chars. Vectors are stored unit-length (normalised once at write) with a `normalized` flag migrating older sidecars.
+- **Reason**: the layer never converged — 4386 memories reported 0 vectors on every call, so `auto` resolved to BM25 forever. Three defects compounded: 256 memories per request exceeded the timeout; the all-or-nothing write discarded the whole pass on any failure; and one unbounded call ran the entire ~10-minute backfill inside a single await.
+- **Process**: measured the provider directly — 64 inputs 9.4s, 256 inputs 16.1s against a 15s ceiling, which pinned the batch size as the cause. Verified convergence live: coverage advanced 768 -> 1726 -> 2199 -> 2711 -> 3223 -> 3735 -> 4140 -> 4395 across bounded rounds, surviving a timeout in round 1 and a provider 400 in round 6. The single permanently-failing memory was the same 250,819-char record quarantined earlier, re-entered through the unguarded `write-add` path with `delivery: failed, Upload rejected (HTTP 400)`. Benchmarked the normalisation change on the live sidecar: 5656ms -> 49ms, 115x, identical top-10.
+- **Result**: 4395/4396 coverage, then 4396/4396 after removing the poison pill (quarantined with sha256). 207 tests, typecheck clean.
+- **Notes**: an unclamped 250,819-char memory produced HTTP 400 for its entire batch, so one bad record could stall the layer permanently — the input cap is what makes that a per-memory degradation. The local write path lacked the guard the harvest path had; both now share `clampMemory`.
+
+## feat(recall): strategy registry, auto resolution, and cross-encoder reranking
+
+`ef0b71a` | 2026-09-27
+
+- **Changes**: `src/recall/plan.ts` — plan registry, preference ladders, `resolveStrategy` returning the chosen plan plus every skip and its reason. `src/recall/rerank.ts` — OpenRouter cross-encoder over the fused pool, default `voyageai/rerank-2.5-lite`. Default strategy becomes `auto`. `RankLocal` resolves a plan rather than comparing strategy strings; reranking receives a text resolver instead of reading storage.
+- **Reason**: the strategy was a string compared against literal lists across `rankLocal`, and the default was fusion — which the gold set showed costs more than it adds once a reranker is present.
+- **Process**: verified both OpenRouter endpoints before wiring (embeddings 4096 dims at $0.00000015 for 15 tokens; rerank ordering correctly at $0.0000006 for 30 tokens). Noted that `FusedHit` carries only ids, so the reranker had no documents to score — the text resolver closes that gap. Added 12 rerank tests and 21 plan tests, including an invariant that every ladder terminates in a plan needing no capability, which makes resolution total.
+- **Result**: ladder `dense+rerank -> dense -> bm25`, every step reported with its reason. 209 tests, typecheck clean.
+- **Notes**: a plan is chosen from measured NDCG rather than preference, and each plan carries its number so the shipped default is traceable. Fusion stays registered and reachable so the comparison remains reproducible.
+
+## feat(eval): candidate-pool and sampling stage for a gold set
+
+`a27e828` | 2026-09-27
+
+- **Changes**: `scripts/build-gold.mjs` — credential-free; reads the store and shadow log, filters noise, dedupes queries, builds a per-query candidate pool as the union of every recorded ranking intersected with ids the mirror still holds, stratifies by query shape, samples deterministically (mulberry32, seed default 20260927), and writes `gold-candidates.json` with the judging protocol embedded.
+- **Reason**: the shadow log scores local recall against mem0's own top-10, which measures imitation. A local retriever that answers better than mem0 scores worse under that metric, and mem0's misses are inherited as truth.
+- **Process**: added a pool-domination statistic specifically to detect the bias the union design guards against — measured dense 46.9%, remote 44.7%, local 40.6%, so the pool is retriever-neutral in practice. Tightened noise filtering across three passes after inspecting the samples (quoted paths, bracketed diagnostics, `Task:` subagent dispatches, scratch probes).
+- **Result**: 448 shadow entries -> 314 eligible queries -> 57 sampled (terse-cjk 11, cjk-only 20, mixed 20, latin 6).
+- **Notes**: a pool built from one retriever can never contain another's correct answer, which is the whole reason for the union. `gold.json` and `gold-candidates.json` are gitignored build artifacts keyed to a corpus snapshot.
+
+## docs: rewrite contrastive comments as direct statements
+
+`3942995` | 2026-09-27
+
+- **Changes**: swept `src/index.ts`, `src/recall/*.ts`, and every test file for contrastive patterns and rewrote each hit as an additive statement. No behaviour change.
+- **Reason**: house writing rule — no contrastive or negation-pivot rhetoric in any medium, code comments and test names included.
+- **Process**: grep sweep across the banned Chinese and English forms; the sweep now returns empty.
+- **Result**: 158 tests still pass; typecheck clean.
+- **Notes**: comments state what the code does and why, without framing it against what it replaced.
+
+## fix(scope): isolate local reads by request scope, classify v3 paths
+
+`d7ba14e` | 2026-09-27
+
+- **Changes**: `src/recall/scope.ts` — scope key extraction from both carriers (body and query string), matching, and corpus filtering before ranking. `rankLocal` takes a scope and filters before any channel sees the corpus; the embed harness intersects its results with the scoped id set. `read-getall` previously answered with every memory of every app. `classify()` widened from `/v1/memories/<id>` to `/v[13]/`.
+- **Reason**: local reads honoured no client filter, which was invisible while local recall was too weak to serve answers and became a correctness defect the moment fusion made it usable.
+- **Process**: TDD — 14 unit cases plus 6 end-to-end cases through a mounted entry. Verified against the live store that harvest preserves scope (all 4368 live memories carried `user_id` and `app_id`), so no backfill was needed.
+- **Result**: 158 tests, typecheck clean.
+- **Notes**: the largest finding was incidental — mem0ai 3.1.5 mixes API versions by operation (`/v3/` for search and add, `/v1/` for single-item get/update/delete/history), so every v3 single-item read had been silently bypassing the local path.
+
+
 ## fix(consistency): echo writes into mirror, invalidate read cache, replay write ops on sync
 
 `54b4992` | 2026-09-05
