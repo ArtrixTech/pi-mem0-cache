@@ -41,10 +41,9 @@ function appendQuarantine(entry: { id: string; chars: number; memory: string }):
   const path = process.env.MEM0_HARVEST_QUARANTINE_PATH ?? DEFAULT_QUARANTINE_PATH;
   try {
     mkdirSync(dirname(path), { recursive: true });
-    // One entry per id. A repeat is the same original text rather than new
-    // information, and appending it again on every load would grow the file
-    // without bound. The scan is over a small file and runs only when a memory
-    // actually exceeds the cap.
+    // One entry per id. A repeat carries the same original text, so appending it
+    // on every load would grow the file without bound. The scan covers a small
+    // file, and it runs only when a memory exceeds the cap.
     if (existsSync(path)) {
       const marker = `"id":${JSON.stringify(entry.id)},`;
       const seen = readFileSync(path, "utf8").includes(marker);
