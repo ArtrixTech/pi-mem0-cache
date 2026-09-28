@@ -124,3 +124,41 @@ describe("embedder input guard", () => {
     expect(fetchImpl).not.toHaveBeenCalled();
   });
 });
+
+
+describe("quarantine sidecar", () => {
+  it("keeps one entry per id across repeated clamps", () => {
+    const path = join(mkdtempSync(join(tmpdir(), "mem0-qrace-")), "q.jsonl");
+    const previous = process.env.MEM0_HARVEST_QUARANTINE_PATH;
+    process.env.MEM0_HARVEST_QUARANTINE_PATH = path;
+    try {
+      const text = "z".repeat(MAX_MEMORY_CHARS * 2);
+      for (let i = 0; i < 8; i++) clampMemory(text, "race-id");
+      const lines = readFileSync(path, "utf8").split("\n").filter(Boolean);
+      expect(lines).toHaveLength(1);
+      expect(JSON.parse(lines[0]).id).toBe("race-id");
+    } finally {
+      if (previous === undefined) delete process.env.MEM0_HARVEST_QUARANTINE_PATH;
+      else process.env.MEM0_HARVEST_QUARANTINE_PATH = previous;
+    }
+  });
+
+  it("keeps entries written for other ids", () => {
+    const path = join(mkdtempSync(join(tmpdir(), "mem0-qkeep-")), "q.jsonl");
+    const previous = process.env.MEM0_HARVEST_QUARANTINE_PATH;
+    process.env.MEM0_HARVEST_QUARANTINE_PATH = path;
+    try {
+      const text = "z".repeat(MAX_MEMORY_CHARS * 2);
+      clampMemory(text, "first");
+      clampMemory(text, "second");
+      const ids = readFileSync(path, "utf8")
+        .split("\n")
+        .filter(Boolean)
+        .map((l) => JSON.parse(l).id);
+      expect(ids).toEqual(["first", "second"]);
+    } finally {
+      if (previous === undefined) delete process.env.MEM0_HARVEST_QUARANTINE_PATH;
+      else process.env.MEM0_HARVEST_QUARANTINE_PATH = previous;
+    }
+  });
+});

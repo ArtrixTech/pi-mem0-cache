@@ -4,7 +4,7 @@
  * floor.
  */
 
-import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { DEFAULT_QUARANTINE_PATH, MAX_FALLBACK_RESULTS, MAX_MEMORY_CHARS } from "./types.js";
 import type { LocalMemory, MemoryOverflow, Store } from "./types.js";
@@ -42,14 +42,28 @@ function appendQuarantine(entry: { id: string; chars: number; memory: string }):
   try {
     mkdirSync(dirname(path), { recursive: true });
     // One entry per id. A repeat carries the same original text, so appending it
-    // on every load would grow the file without bound. The scan covers a small
-    // file, and it runs only when a memory exceeds the cap.
+    // on every load would grow the file without bound.
+    //
+    // The rewrite is idempotent by id and lands through a rename, so two
+    // sessions clamping the same record cannot both append. An
+    // exists-then-append pair lost that race: both sides read a file without
+    // the id, and both appended. A merge here keeps entries the other session
+    // wrote, and a torn read leaves the file untouched for the next attempt.
+    let lines: string[] = [];
     if (existsSync(path)) {
-      const marker = `"id":${JSON.stringify(entry.id)},`;
-      const seen = readFileSync(path, "utf8").includes(marker);
-      if (seen) return;
+      const raw = readFileSync(path, "utf8");
+      lines = raw.split("\n").filter(Boolean);
+      for (const line of lines) {
+        try {
+          if ((JSON.parse(line) as { id?: string }).id === entry.id) return;
+        } catch {
+          // A partial line from an interrupted write; drop it on rewrite.
+        }
+      }
     }
-    appendFileSync(path, `${JSON.stringify(entry)}\n`);
+    const tmp = `${path}.tmp-${process.pid}`;
+    writeFileSync(tmp, `${[...lines, JSON.stringify(entry)].join("\n")}\n`);
+    renameSync(tmp, path);
   } catch (err) {
     console.warn("[pi-mem0-cache] failed to append quarantine entry:", err);
   }
