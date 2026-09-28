@@ -1,5 +1,20 @@
 # devlog
 
+## feat(shadow): accuracy report over the whole log, sliced by build and date
+
+`4938a74` | 2026-09-28
+
+- **Changes**: `src/shadow-report.ts` (nDCG, stratification, sample-size gate, formatter); `/mem0-cache shadow-report [--version X] [--since YYYY-MM-DD]`; `test/shadow-report.test.ts` (16 tests). Every entry now records its `scope`.
+- **Reason**: `/mem0-cache shadow` reports means over whatever the log holds, which answers "how are we doing lately". It cannot answer "how have we done since version X", because a mean carries no provenance, and the command surface had no way to filter.
+- **Process**: First measured what the live log actually supports: `dense+rerank` held 5 comparisons and `localDense`/`localDenseRerank` existed on only those entries, since the fields are days old. Ran the report against the real 476-entry log and checked every number by hand before writing tests.
+- **Result**: 264 tests. Live report reads `dense+rerank n=5 nDCG@10 0.157 [indicative only]` against `dense n=289 nDCG@10 0.179` and `legacy n=407 nDCG@10 0.077` — the new strategy is unmeasurable at current volume, which the gate makes visible instead of presenting as a finding.
+- **Notes**:
+  - nDCG@10 grades the remote top-1 as most relevant and the rest of its top-10 as less relevant. No human judged these queries and an LLM judge cannot label every live read, so the remote ranking is the reference. These figures measure agreement with the API; the gold set measures absolute relevance, and a strategy that beats the API on a query scores lower here.
+  - A strategy that did not run is excluded from its own denominator. Counting it as a zero would make a channel look worse purely because it failed to run.
+  - `MIN_COMPARISONS = 30` marks a thin row "indicative only". Without it, a 5-sample mean reads exactly like a 289-sample one.
+  - Two test failures came from my own expectations: the date filter is local-time (a UTC midnight timestamp lands on the previous local day), and scope labels sort alphabetically. Both were the code behaving correctly against a careless assertion.
+  - Nothing re-runs retrieval. A stored entry describes the corpus at write time, and re-running it against today's corpus would produce a number belonging to no real moment.
+
 ## fix(memory): make the quarantine append safe to repeat
 
 `103c0f8` | 2026-09-28
