@@ -52,7 +52,7 @@ dense+rerank   ← embeddings and reranker both working   (nDCG@10 0.821)
    bm25
 ```
 
-Every step down is recorded in the shadow log rather than applied silently. An explicit strategy (`dense`, `fusion`, `dense+rerank`, `bm25`, `legacy`) pins the pipeline and disables the ladder, which is what makes A/B runs meaningful. `/mem0-cache provider` prints the resolved plan, what was skipped and why, and each provider's credential source.
+Every step down is recorded in the shadow log. An explicit strategy (`dense`, `fusion`, `dense+rerank`, `bm25`, `legacy`) pins the pipeline and disables the ladder, which is what makes A/B runs meaningful. `/mem0-cache provider` prints the resolved plan, what was skipped and why, and each provider's credential source.
 
 **Why BM25 is not in the serving path.** It was measured, and it lost: scoring 57 judged queries over a mean 2570 in-scope memories, `fusion` reached nDCG@10 0.633 against `dense`'s 0.677, and `fusion+rerank` tied `dense+rerank` at 0.821 while running one extra channel. With a reranker already reordering the pool, lexical candidates consume slots that have to be reordered past. BM25 keeps the role it is actually good at — the local floor that answers when every provider is gone, and precise matching on identifiers, file names, and error strings. `MEM0_FUSION_BM25_WEIGHT` (default 0.4) controls its weight when a fusion strategy is explicitly requested.
 
