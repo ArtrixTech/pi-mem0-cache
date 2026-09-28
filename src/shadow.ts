@@ -18,6 +18,7 @@ import {
   type ChannelHit,
 } from "./recall/fusion.js";
 import { extractScope, matchesScope } from "./recall/scope.js";
+import { CODE_VERSION, SHADOW_SCHEMA_VERSION } from "./version.js";
 import { searchLocalScored } from "./memory.js";
 import { SHADOW_KEEP_LINES, SHADOW_ROTATE_BYTES } from "./types.js";
 import type { ClassifiedRequest, Store } from "./types.js";
@@ -39,6 +40,12 @@ export interface ShadowRemoteHit {
 
 export interface ShadowEntry {
   ts: number;
+  /** Field-structure version, so a reader can tell an absent field from one the
+   *  writer did not know about. See src/version.ts. */
+  schemaVersion?: number;
+  /** The running code's version at write time. Lets a report answer "since
+   *  version X" without guessing which build produced an entry. */
+  codeVersion?: string;
   /** remote = miss answered by the API; fallback = API failed, local answered */
   mode: "remote" | "fallback";
   query: string;
@@ -273,6 +280,8 @@ export async function recordShadow(
   const { overlap5, overlap10, mrr } = compareShadow(local, remote);
   const entry: ShadowEntry = {
     ts: Date.now(),
+    schemaVersion: SHADOW_SCHEMA_VERSION,
+    ...(CODE_VERSION ? { codeVersion: CODE_VERSION } : {}),
     mode,
     query: query.slice(0, 200),
     local,
