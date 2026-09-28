@@ -6,7 +6,7 @@ describe("tokenizeBM25", () => {
     expect(tokenizeBM25("HK Express")).toEqual(["hk", "express"]);
   });
 
-  it("drops punctuation but keeps alphanumerics", () => {
+  it("drops punctuation and keeps alphanumerics", () => {
     expect(tokenizeBM25("gpdev: node >=24.18.0")).toEqual(["gpdev", "node", "24", "18", "0"]);
   });
 

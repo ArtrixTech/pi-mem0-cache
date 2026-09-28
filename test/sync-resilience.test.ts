@@ -86,8 +86,7 @@ describe("sync queue resilience", () => {
     expect(quarantine.map((q) => q.id)).toEqual(["local-poison"]);
 
     // Once quarantined it leaves the queue: it survives in the store as a
-    // record but no longer counts as pending, and no further request is made
-    // for it.
+    // record, stops counting as pending, and draws no further request.
     const before = third.attempts;
     const fourth = await runner.sync(true);
     expect(fourth.skipped).toBe(true);

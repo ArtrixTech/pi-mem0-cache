@@ -52,6 +52,19 @@ describe("review finding 1: an intentional wipe reaches the disk copy", () => {
     expect(Object.keys(read().memories)).toEqual([]);
   });
 
+  it("stays cleared when the same session saves twice", () => {
+    // The marker is consumed on the first save, so the second save of the same
+    // session must not fall back to the disk corpus it just deleted.
+    const { path, read, save } = onFile({ a: record("a", "one") });
+    const store = loadStore(path);
+    store.memories = {};
+    store.wipedAt = Date.now();
+    save(store);
+    expect(Object.keys(read().memories)).toEqual([]);
+    save(store);
+    expect(Object.keys(read().memories)).toEqual([]);
+  });
+
   it("keeps the corpus when the map is merely empty, with no wipe recorded", () => {
     // An empty in-memory map without the marker is a session that has not
     // loaded anything yet. Its save must leave the disk corpus alone.
@@ -247,7 +260,7 @@ describe("review finding 5: auth and endpoint failures are not permanent", () =>
 });
 
 describe("review finding 9: a wildcard scope never reaches the payload", () => {
-  it("drops app_id=* rather than storing a memory under it", () => {
+  it("drops a wildcard app_id before storing the memory", () => {
     // mem0 stores a "*"-valued write so that no later read can reach it, the
     // asymmetry behind mem0ai/mem0#6168. The read path drops the wildcard; the
     // write path was passing it through.

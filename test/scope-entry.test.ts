@@ -140,7 +140,7 @@ describe("scope isolation on local reads", () => {
     // SDK single-item GET: scope travels in the query string, since a GET
     // cannot carry a body under the fetch standard.
     const res = await f(`${GETALL_URL}b-1?user_id=artrix&app_id=artrix-reach`, { method: "GET" });
-    // b-1 exists and is live, but belongs to another app: the local path must
+    // b-1 exists and is live under another app: the local path must
     // not answer with it.
     expect(res.status).toBe(404);
   });

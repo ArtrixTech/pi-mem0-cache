@@ -80,9 +80,12 @@ export function makeSaver(store: Store, path: string): () => void {
       // A local wipe is recorded explicitly. Without the marker an empty
       // in-memory map is indistinguishable from a session that never loaded the
       // corpus, and basing the result on the disk map restored everything
-      // `/mem0-cache clear-all` had just removed.
+      // `/mem0-cache clear-all` had just removed. The marker is consumed here:
+      // the written file is the record of the wipe, and a marker left in it
+      // would suppress the disk basis for every later save in every session.
       const wiped = store.wipedAt !== undefined;
       const merged: Record<string, LocalMemory> = wiped ? {} : { ...(disk.memories as Record<string, LocalMemory>) };
+      delete store.wipedAt;
       for (const [id, mine] of Object.entries(store.memories)) {
         const theirs = merged[id];
         if (!theirs) {
