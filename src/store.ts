@@ -79,12 +79,33 @@ export function makeSaver(store: Store, path: string): () => void {
           merged[id] = mine;
           continue;
         }
-        const mineAt = Date.parse(mine.updated_at ?? mine.created_at ?? "") || 0;
-        const theirsAt = Date.parse(theirs.updated_at ?? theirs.created_at ?? "") || 0;
-        // A tombstone and a live record for the same id: the more recent write
-        // decides, which is what makes a delete survive a concurrent update.
-        if (mineAt > theirsAt) merged[id] = mine;
-        else if (mineAt === theirsAt && mine.deleted) merged[id] = mine;
+        // An unparseable or missing timestamp yields -Infinity so it loses to
+        // any real timestamp. `Date.parse(x) || 0` collapsed both sides to 0,
+        // which left a live disk record winning over an in-memory tombstone.
+        const at = (m: LocalMemory): number => {
+          const t = Date.parse(m.updated_at ?? m.created_at ?? "");
+          return Number.isFinite(t) ? t : Number.NEGATIVE_INFINITY;
+        };
+        const mineAt = at(mine);
+        const theirsAt = at(theirs);
+        // A deletion is a decision someone made, and the live record is the
+        // state that decision removed. It wins on any comparison that is not a
+        // strictly older timestamp, which covers equal instants, a missing
+        // timestamp on either side, and a tombstone written against a record
+        // whose timestamp it inherited.
+        if (mine.deleted && !theirs.deleted && mineAt >= theirsAt) {
+          merged[id] = mine;
+          continue;
+        }
+        if (theirs.deleted && !mine.deleted) continue;
+        if (mineAt > theirsAt) {
+          merged[id] = mine;
+          continue;
+        }
+        if (mineAt < theirsAt) continue;
+        // Equally recent, both live or both tombstoned: prefer a tombstone so
+        // the deletion survives, and keep the disk copy otherwise.
+        if (mine.deleted) merged[id] = mine;
       }
       store.memories = merged;
       // Ops are additive per process and replay is idempotent, so the union is
@@ -98,7 +119,10 @@ export function makeSaver(store: Store, path: string): () => void {
           seen.add(opsKey(op));
         }
       }
-      store.cache = { ...(disk.cache ?? {}), ...store.cache };
+      // The in-memory cache is authoritative. A key absent from it was either
+      // never fetched here or deliberately cleared, so it is dropped at the
+      // single site that decides. Spreading disk first brought a cleared entry
+      // straight back on the next save.
     } catch {
       // A parse failure means another process is mid-write; this save wins.
     }

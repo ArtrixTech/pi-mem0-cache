@@ -4,7 +4,7 @@
  * floor.
  */
 
-import { appendFileSync, mkdirSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { DEFAULT_QUARANTINE_PATH, MAX_FALLBACK_RESULTS, MAX_MEMORY_CHARS } from "./types.js";
 import type { LocalMemory, MemoryOverflow, Store } from "./types.js";
@@ -28,6 +28,9 @@ function truncateSafe(text: string, cap: number): string {
  */
 export function clampMemory(text: string, id: string): { text: string; overflow?: MemoryOverflow } {
   if (text.length <= MAX_MEMORY_CHARS) return { text };
+  // The sidecar records what was cut, once per record: `loadStore` re-runs this
+  // on every load, and an unconditional append grew it by a copy of the same
+  // original each time a session started.
   appendQuarantine({ id, chars: text.length, memory: text });
   return { text: truncateSafe(text, MAX_MEMORY_CHARS), overflow: { originalChars: text.length, truncatedAt: MAX_MEMORY_CHARS } };
 }
@@ -38,6 +41,15 @@ function appendQuarantine(entry: { id: string; chars: number; memory: string }):
   const path = process.env.MEM0_HARVEST_QUARANTINE_PATH ?? DEFAULT_QUARANTINE_PATH;
   try {
     mkdirSync(dirname(path), { recursive: true });
+    // One entry per id. A repeat is the same original text rather than new
+    // information, and appending it again on every load would grow the file
+    // without bound. The scan is over a small file and runs only when a memory
+    // actually exceeds the cap.
+    if (existsSync(path)) {
+      const marker = `"id":${JSON.stringify(entry.id)},`;
+      const seen = readFileSync(path, "utf8").includes(marker);
+      if (seen) return;
+    }
     appendFileSync(path, `${JSON.stringify(entry)}\n`);
   } catch (err) {
     console.warn("[pi-mem0-cache] failed to append quarantine entry:", err);
