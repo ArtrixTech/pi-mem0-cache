@@ -79,7 +79,7 @@ describe("cosine / searchLocalVector", () => {
     // normalise anything themselves.
     expect(cosine([1, 0], [1, 0])).toBeCloseTo(1);
     expect(cosine([1, 0], [0, 1])).toBeCloseTo(0);
-    // A non-unit vector is treated as-is rather than rescaled: normalising here is
+    // A non-unit vector is treated as-is: normalising here is
     // exactly the cost this function was changed to avoid.
     expect(cosine([1, 0], [2, 0])).toBeCloseTo(2);
   });
@@ -192,7 +192,7 @@ describe("createEmbedHarness", () => {
     expect(await harness.search("alpha q")).toBeNull();
     const s = harness.status();
     expect(s.lastError).toContain("query embedding failed");
-    // No cooldown: the next read tries again rather than being served by BM25.
+    // No cooldown: the next read tries dense again.
     expect(s.cooldownUntil).toBeUndefined();
     expect(s.enabled).toBe(true);
   });
@@ -351,7 +351,7 @@ describe("summarizeShadow with vector side", () => {
     expect(s.strategies.dense).toMatchObject({ comparisons: 1, meanMrr: 1, top1Rate: 1 });
     // legacy ran on both remote entries.
     expect(s.strategies.legacy.comparisons).toBe(2);
-    // A strategy absent from every entry reports zero comparisons rather than a
+    // A strategy absent from every entry reports zero comparisons and
     // misleading 0.000 score over the full set.
     for (const name of ["bm25", "fusion", "dense+rerank"]) {
       expect(s.strategies[name].comparisons, name).toBe(0);

@@ -38,7 +38,7 @@ beforeAll(async () => {
   if (embed) {
     console.log("ensuring vectors…");
     // Bounded by EMBED_MAX_BATCHES_PER_CALL, so this returns in about a minute
-    // rather than running the whole backfill inside the hook.
+    // keeping the whole backfill out of the hook.
     await embed.ensure();
     const s = embed.status();
     console.log(`  embed layer: ${s.vectors}/${s.corpus} vectors, enabled=${s.enabled}${s.lastError ? `, last error: ${s.lastError}` : ""}`);

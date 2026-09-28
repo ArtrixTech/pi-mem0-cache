@@ -147,7 +147,7 @@ function normalizeGrades(parsed, validIds) {
     const raw = item.grade ?? item.score ?? item.relevance;
     if (!id || !validIds.has(id)) continue;
     const g = Number(raw);
-    // Clamp rather than reject: a 3 or a fractional score still carries a signal,
+    // Clamp: a 3 or a fractional score still carries a signal,
     // and dropping it would silently shrink the judged set.
     if (!Number.isFinite(g)) continue;
     grades[id] = g <= 0 ? 0 : g >= 2 ? 2 : g >= 1 ? 1 : 0;
@@ -246,7 +246,7 @@ if (existsSync(OUT)) {
   try {
     existing = JSON.parse(readFileSync(OUT, "utf8"));
   } catch {
-    /* corrupt partial write: start over rather than guess */
+    /* corrupt partial write: start over */
   }
 }
 const doneQueries = new Map();

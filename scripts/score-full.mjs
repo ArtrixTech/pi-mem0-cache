@@ -12,7 +12,7 @@
  * WHY NOT THE FIRST GOLD SET
  * gold.json scored each scorer over a ~19-candidate pool built from recorded
  * top-10s. Every relevant memory was already inside that pool, so it measured
- * reordering rather than retrieval, and it was biased toward whichever retriever
+ * reordering, and it was biased toward whichever retriever
  * contributed the most candidates. gold-full.json removes both problems.
  *
  * METRICS

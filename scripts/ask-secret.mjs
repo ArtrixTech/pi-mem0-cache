@@ -139,7 +139,7 @@ if (args.mode === "list") {
       const shape = SHAPES[provider];
       const ok = shape ? shape.test(value) : true;
       // A stored key that fails its own shape check is the failure mode this tool
-      // exists to catch, so it gets said out loud rather than shown as SET.
+      // exists to catch, so it gets said out loud.
       console.log(`  ${provider.padEnd(11)} SET  len ${String(value.length).padStart(3)}  shape ${ok ? "ok" : "NO — re-store it"}`);
       found++;
     } else {

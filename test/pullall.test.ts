@@ -117,7 +117,7 @@ describe("ensureEmbeddings chunking", () => {
     expect(batchSizes).toEqual([256, 256, 88]);
     expect(Object.keys(vecStore.vectors)).toHaveLength(600);
     // Every batch persists, so an interrupted backfill resumes from where it got
-    // to rather than starting over.
+    // kept, so a later run continues from it.
     expect(saves).toBe(3);
   });
 

@@ -30,7 +30,7 @@ describe("clampMemory", () => {
     expect(r.overflow).toEqual({ originalChars: MAX_MEMORY_CHARS + 500, truncatedAt: MAX_MEMORY_CHARS });
   });
 
-  it("quarantines the original text rather than discarding it", () => {
+  it("quarantines the original text alongside trimming the copy", () => {
     const original = "y".repeat(MAX_MEMORY_CHARS + 10);
     clampMemory(original, "id-3");
     const lines = readFileSync(process.env.MEM0_HARVEST_QUARANTINE_PATH!, "utf8").trim().split("\n");

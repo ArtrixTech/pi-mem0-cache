@@ -10,7 +10,7 @@
  * top candidates.
  *
  * The reranker is deliberately optional at every level: a missing key, a dead
- * provider, or a slow response must degrade to the fused order rather than to no
+ * provider, or a slow response must degrade to the fused order: the fused order is
  * answer. Callers pass it in; `recall()` catches a throw and keeps the fusion.
  */
 

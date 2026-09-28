@@ -6,7 +6,7 @@
  * The shadow log scores local recall against mem0's own top-10. That measures
  * imitation: a local retriever that answers *better* than mem0 scores *worse*,
  * and mem0's own misses are inherited as truth. Every ship/no-ship decision about
- * the local path needs a gold set instead — a set of queries with relevance
+ * the local path needs a gold set: queries carrying independent relevance
  * judged on the query and the memory text alone, with no reference to any
  * retriever's ranking.
  *
@@ -107,7 +107,7 @@ function isNoise(query) {
   if (q.length < MIN_QUERY_CHARS || q.length > MAX_QUERY_CHARS) return true;
   // Strip wrapping quotes first: a quoted path is still a path.
   const bare = q.replace(/^['"`]|['"`]$/g, "").trim();
-  // A lone path, with or without a file extension, is a paste rather than a query.
+  // A lone path, with or without a file extension, reads as a paste.
   if (/^(\/|[A-Za-z]:\\|~\/)/.test(bare) && !/\s/.test(bare)) return true;
   // A path that is most of the string, even with trailing words.
   if (/^(\/|[A-Za-z]:\\|~\/)\S*\.[A-Za-z0-9]{1,5}$/.test(bare)) return true;

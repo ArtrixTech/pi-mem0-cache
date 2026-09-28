@@ -105,7 +105,7 @@ describe("resolveStrategy", () => {
 
   it("always resolves, for every requested strategy and capability combination", () => {
     // Resolution is total: the health command and the serving path both depend on
-    // it returning a plan rather than throwing.
+    // it returning a plan. 
     for (const requested of STRATEGY_NAMES) {
       for (const caps of [BOTH, DENSE_ONLY, NEITHER]) {
         const r = resolveStrategy(requested as StrategyName, caps);
@@ -169,7 +169,7 @@ describe("parseStrategy", () => {
     expect(parseStrategy(undefined)).toBeUndefined();
     expect(parseStrategy("")).toBeUndefined();
     expect(parseStrategy("nope")).toBeUndefined();
-    // Back-compat guard: a typo must fall through to the default rather than be
+    // Back-compat guard: a typo falls through to the default and is
     // coerced into a plan nobody chose.
     expect(parseStrategy("Dense")).toBeUndefined();
   });

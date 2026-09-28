@@ -33,7 +33,7 @@ describe("parseRerankResponse", () => {
     expect(out[0].score).toBe(0.42);
   });
 
-  it("drops out-of-range indices instead of producing undefined ids", () => {
+  it("drops out-of-range indices and never produces undefined ids", () => {
     const out = parseRerankResponse({ results: [{ index: 9, relevance_score: 1 }, { index: 0, relevance_score: 0.5 }] }, ["a"]);
     expect(out.map((h) => h.id)).toEqual(["a"]);
   });

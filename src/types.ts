@@ -39,7 +39,7 @@ export const EMBED_COOLDOWN_MS = 60 * 1000;
  *  batch. 64 x ~250 chars is roughly 4K tokens: large enough to be efficient,
  *  small enough to finish inside the per-request timeout. A batch is closed at
  *  whichever limit is reached first, so a run of unusually long memories produces
- *  more, smaller requests rather than one oversized one. */
+ *  more, smaller requests. */
 export const EMBED_BATCH_SIZE = Number(process.env.MEM0_EMBED_BATCH_SIZE) > 0 ? Number(process.env.MEM0_EMBED_BATCH_SIZE) : 64;
 export const EMBED_BATCH_CHARS = 16_000;
 /** Batches per `ensure()` call. 8 x 64 inputs is 512 memories, roughly 75s at ~9s
@@ -105,7 +105,7 @@ export interface SyncState {
    *  so it stops consuming a request per run. */
   failures?: Record<string, number>;
   /** Items retired from the queue, with the reason. Kept so a wrongly-retired
-   *  memory can be found and re-queued instead of vanishing. */
+   *  memory can be found and re-queued. */
   quarantined?: Record<string, { reason: string; at: number }>;
 }
 

@@ -61,7 +61,7 @@ export interface StrategyPlan {
   rerank: boolean;
   /** NDCG@10 measured on the gold set, or null for a plan never measured at this
    *  candidate-pool width. Surfaced in the health command so the shipped default
-   *  is traceable to a number rather than a preference. */
+   *  is traceable to a measurement. */
   measuredNdcg: number | null;
   summary: string;
 }

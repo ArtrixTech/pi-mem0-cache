@@ -191,7 +191,7 @@ function score(rows, k = K) {
     mrr: mean(rr),
     hit10: mean(hits),
     // Queries whose pool holds no relevant memory at all: excluded from nDCG and
-    // recall (no answer exists), so they are reported separately rather than
+    // recall (no answer exists), so they are reported separately and
     // silently deflating the score.
     empty: rows.filter((r) => !Object.values(r.grades).some((g) => g >= 1)).length,
   };
