@@ -7,10 +7,13 @@ import { EmbedHarnessChannel } from "./rank.js";
 import {
   appendFileSync,
   existsSync,
+  mkdirSync,
   readFileSync,
+  readdirSync,
+  renameSync,
   statSync,
-  writeFileSync,
 } from "node:fs";
+import { basename, dirname, join } from "node:path";
 import {
   LEXICAL_WEIGHT_DEFAULT,
   LexicalChannel,
@@ -20,7 +23,7 @@ import {
 import { extractScope, matchesScope } from "./recall/scope.js";
 import { CODE_VERSION, SHADOW_SCHEMA_VERSION } from "./version.js";
 import { searchLocalScored } from "./memory.js";
-import { SHADOW_KEEP_LINES, SHADOW_ROTATE_BYTES } from "./types.js";
+import { SHADOW_ROTATE_BYTES } from "./types.js";
 import type { ClassifiedRequest, Store } from "./types.js";
 import type { EmbedHarness } from "./embed.js";
 import type { Reranker } from "./rank.js";
@@ -180,41 +183,79 @@ export function summarizeShadow(entries: ShadowEntry[]): ShadowSummary {
   };
 }
 
-/** Append one entry, then compact the file once it exceeds rotateBytes,
- *  keeping the most recent keepLines lines. */
+/** Append one entry, sealing the active segment when it grows past
+ *  rotateBytes.
+ *
+ * Sealing renames the full segment to a date-stamped sibling and starts a fresh
+ * active file. Nothing is deleted, so a report can read the whole history rather
+ * than a sliding window of the most recent lines.
+ *
+ * The active path keeps its configured name, which means an existing log written
+ * by an earlier version becomes the first active segment and its entries stay
+ * readable without a migration step.
+ */
 export function appendShadowLog(
   path: string,
   entry: ShadowEntry,
   rotateBytes = SHADOW_ROTATE_BYTES,
-  keepLines = SHADOW_KEEP_LINES,
 ): void {
   try {
+    mkdirSync(dirname(path), { recursive: true });
     appendFileSync(path, `${JSON.stringify(entry)}\n`);
-    if (statSync(path).size > rotateBytes) {
-      const lines = readFileSync(path, "utf8").split("\n").filter(Boolean);
-      writeFileSync(path, `${lines.slice(-keepLines).join("\n")}\n`);
-    }
+    if (statSync(path).size <= rotateBytes) return;
+    // A date-stamped name sorts with the other segments and distinguishes a
+    // repeated seal on the same day from the one before it.
+    const stamp = new Date().toISOString().slice(0, 10);
+    const base = path.replace(/\.jsonl$/, "");
+    let target = `${base}-${stamp}.jsonl`;
+    for (let n = 1; existsSync(target); n++) target = `${base}-${stamp}-${n}.jsonl`;
+    renameSync(path, target);
   } catch (err) {
     console.warn("[pi-mem0-cache] failed to append shadow log:", err);
   }
 }
 
-export function readShadowEntries(path: string): ShadowEntry[] {
+/** Every segment belonging to one shadow log, oldest first.
+ *
+ * The active file comes last so a caller that reads in order sees history in
+ * time order. A sealed segment carries its seal date in the name; entries inside
+ * it carry their own `ts`, which is what the report actually sorts on.
+ */
+export function shadowSegments(path: string): string[] {
+  const dir = dirname(path);
+  const base = basename(path).replace(/\.jsonl$/, "");
+  const sealed: string[] = [];
   try {
-    if (!existsSync(path)) return [];
-    const entries: ShadowEntry[] = [];
-    for (const line of readFileSync(path, "utf8").split("\n")) {
-      if (!line.trim()) continue;
-      try {
-        entries.push(JSON.parse(line) as ShadowEntry);
-      } catch {
-        /* skip malformed line */
-      }
+    for (const name of readdirSync(dir)) {
+      if (!name.startsWith(`${base}-`) || !name.endsWith(".jsonl")) continue;
+      sealed.push(join(dir, name));
     }
-    return entries;
   } catch {
-    return [];
+    return existsSync(path) ? [path] : [];
   }
+  // Lexicographic order matches chronological order because the name carries an
+  // ISO date, and a same-day n-suffix sorts after the base name.
+  sealed.sort();
+  return existsSync(path) ? [...sealed, path] : sealed;
+}
+
+export function readShadowEntries(path: string): ShadowEntry[] {
+  const entries: ShadowEntry[] = [];
+  for (const segment of shadowSegments(path)) {
+    try {
+      for (const line of readFileSync(segment, "utf8").split("\n")) {
+        if (!line.trim()) continue;
+        try {
+          entries.push(JSON.parse(line) as ShadowEntry);
+        } catch {
+          /* skip malformed line */
+        }
+      }
+    } catch {
+      /* an unreadable segment must not hide the others */
+    }
+  }
+  return entries.sort((a, b) => a.ts - b.ts);
 }
 
 function remoteSearchHits(body: string | null): ShadowRemoteHit[] {

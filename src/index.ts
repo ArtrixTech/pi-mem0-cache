@@ -398,6 +398,7 @@ export {
   appendShadowLog,
   compareShadow,
   readShadowEntries,
+  shadowSegments,
   summarizeShadow,
 } from "./shadow.js";
 export type {

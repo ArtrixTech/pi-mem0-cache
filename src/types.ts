@@ -16,8 +16,12 @@ export const DEFAULT_TTL_MS = 24 * 60 * 60 * 1000;
 export const DEFAULT_REMOTE_READ_INTERVAL_MS = 60 * 60 * 1000;
 export const DEFAULT_429_BLOCK_MS = 5 * 60 * 1000;
 export const DEFAULT_SHADOW_PATH = join(homedir(), ".pi", "agent", "mem0-shadow.jsonl");
+/** Size at which the active segment is sealed and a fresh one starts.
+ *
+ * Sealing renames the active file to a date-stamped sibling and never removes
+ * lines. The previous behaviour truncated the file to the most recent N lines,
+ * which made any cumulative statistic silently lose its earliest evidence. */
 export const SHADOW_ROTATE_BYTES = 4 * 1024 * 1024;
-export const SHADOW_KEEP_LINES = 2000;
 export const DEFAULT_VECTORS_PATH = join(homedir(), ".pi", "agent", "mem0-vectors.json");
 export const DEFAULT_MEM0_CONFIG_PATH = join(homedir(), ".pi", "agent", "mem0-config.json");
 export const DEFAULT_EMBED_MODEL = "jina-embeddings-v5-text-nano";

@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
@@ -9,6 +9,7 @@ import {
   emptyStore,
   readShadowEntries,
   searchLocal,
+  shadowSegments,
   searchLocalScored,
   summarizeShadow,
   type LocalMemory,
@@ -163,29 +164,34 @@ describe("interceptor shadow logging", () => {
 });
 
 describe("shadow log file", () => {
-  it("appends and rotates", () => {
+  it("appends and seals a segment without losing entries", () => {
     const path = join(tmp, "shadow.jsonl");
     for (let i = 0; i < 5; i++) {
       appendShadowLog(
         path,
         { ts: i, mode: "remote", query: `q${i}`, local: [{ id: "a", score: 1 }], remote: [{ id: "a" }], overlap5: 1, overlap10: 1, mrr: 1 },
         200, // tiny rotate threshold
-        3,
       );
     }
+    // Sealing keeps every entry: the full segment is renamed, never truncated.
     const entries = readShadowEntries(path);
-    expect(entries).toHaveLength(3); // rotated down to keepLines
-    expect(entries[2].query).toBe("q4");
-    expect(summarizeShadow(entries)).toMatchObject({ comparisons: 3, fallbacks: 0, meanMrr: 1 });
+    expect(entries).toHaveLength(5);
+    expect(entries.map((e) => e.query)).toEqual(["q0", "q1", "q2", "q3", "q4"]);
+    expect(shadowSegments(path).length).toBeGreaterThan(1);
+    expect(summarizeShadow(entries)).toMatchObject({ comparisons: 5, fallbacks: 0, meanMrr: 1 });
   });
 
   it("tolerates malformed lines and missing files", () => {
-    const path = join(tmp, "shadow-bad.jsonl");
+    // Its own directory: `readShadowEntries` reads every segment beside the
+    // active path, so a malformed sibling would belong to another test's log.
+    const dir = mkdtempSync(join(tmpdir(), "mem0-shadow-bad-"));
+    const path = join(dir, "shadow-bad.jsonl");
     appendShadowLog(path, {
       ts: 1, mode: "remote", query: "q", local: [], remote: [], overlap5: 0, overlap10: 0, mrr: 0,
     });
-    writeFileSync(path, "{broken\n");
-    expect(readShadowEntries(path)).toEqual([]);
+    // A malformed line is skipped; the readable lines beside it still count.
+    writeFileSync(path, `{broken\n${readFileSync(path, "utf8")}`);
+    expect(readShadowEntries(path)).toHaveLength(1);
     expect(readShadowEntries(join(tmp, "missing.jsonl"))).toEqual([]);
     expect(summarizeShadow([])).toMatchObject({ comparisons: 0, fallbacks: 0 });
   });
