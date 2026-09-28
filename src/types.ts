@@ -121,6 +121,9 @@ export interface Store {
   cache: Record<string, CachedResponse>;
   memories: Record<string, LocalMemory>;
   ops: PendingOp[];
+  /** Set when this session deliberately cleared the corpus, so a save knows an
+   *  empty memory map is a decision and not the absence of a load. */
+  wipedAt?: number;
   syncState: SyncState;
   netState: NetState;
   stats: {

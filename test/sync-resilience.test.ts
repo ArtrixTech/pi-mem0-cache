@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -48,7 +48,6 @@ describe("sync queue resilience", () => {
     // chronological queue, every replay of it returned 400, and the loop broke
     // on the first failure — so four ordinary memories behind it never synced,
     // across sessions, for over a week.
-    const log: string[] = [];
     const poison = mem("local-poison", "x".repeat(MAX_MEMORY_CHARS * 3), "2026-09-19T09:19:53.861Z");
     const good1 = mem("local-good-1", "ordinary note one", "2026-09-20T08:05:33.378Z");
     const good2 = mem("local-good-2", "ordinary note two", "2026-09-27T06:33:39.965Z");

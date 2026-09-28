@@ -4,10 +4,10 @@
  */
 
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname } from "node:path";
 import { clampMemory } from "./memory.js";
 import { MAX_MEMORY_CHARS } from "./types.js";
-import type { LocalMemory, PendingOp, Store } from "./types.js";
+import type { LocalMemory, NetState, PendingOp, Store, SyncState } from "./types.js";
 
 export function emptyStore(): Store {
   return {
@@ -47,6 +47,11 @@ export function loadStore(path: string): Store {
         if (clamped.overflow) {
           m.overflow = clamped.overflow;
           store.stats.harvestDropped = (store.stats.harvestDropped ?? 0) + 1;
+          // The clamped text carries a newer timestamp so it wins the save merge
+          // against the oversized disk copy. On a tie the disk side won, wrote
+          // the original back, and every later load clamped and re-appended to
+          // the quarantine sidecar.
+          m.updated_at = new Date().toISOString();
         }
       }
     }
@@ -72,7 +77,12 @@ export function makeSaver(store: Store, path: string): () => void {
       if (!existsSync(path)) return store;
       const disk = JSON.parse(readFileSync(path, "utf8")) as Partial<Store>;
       if (!disk.memories) return store;
-      const merged: Record<string, LocalMemory> = { ...(disk.memories as Record<string, LocalMemory>) };
+      // A local wipe is recorded explicitly. Without the marker an empty
+      // in-memory map is indistinguishable from a session that never loaded the
+      // corpus, and basing the result on the disk map restored everything
+      // `/mem0-cache clear-all` had just removed.
+      const wiped = store.wipedAt !== undefined;
+      const merged: Record<string, LocalMemory> = wiped ? {} : { ...(disk.memories as Record<string, LocalMemory>) };
       for (const [id, mine] of Object.entries(store.memories)) {
         const theirs = merged[id];
         if (!theirs) {
@@ -88,6 +98,13 @@ export function makeSaver(store: Store, path: string): () => void {
         };
         const mineAt = at(mine);
         const theirsAt = at(theirs);
+        // A clamped record is a local mutation worth keeping: the disk copy
+        // held text past the cap, and letting it win on a timestamp tie wrote
+        // the oversized text straight back, so the next load clamped it again.
+        if (mine.overflow && !theirs.overflow) {
+          merged[id] = mine;
+          continue;
+        }
         // A deletion is a decision someone made, and the live record is the
         // state that decision removed. It wins on any comparison that is not a
         // strictly older timestamp, which covers equal instants, a missing
@@ -111,18 +128,58 @@ export function makeSaver(store: Store, path: string): () => void {
       // Ops are additive per process and replay is idempotent, so the union is
       // the safe join: an op queued elsewhere still replays, and a replayed op
       // was already removed from its own side.
-      const opsKey = (o: PendingOp) => `${o.kind}|${o.memoryId ?? ""}|${o.at}`;
+      const opsKey = (o: PendingOp) => `${o.kind}|${o.memoryId ?? ""}|${o.query ?? ""}|${o.at}`;
       const seen = new Set(store.ops.map(opsKey));
+      const retired = store.syncState.quarantined ?? {};
       for (const op of (disk.ops ?? []) as PendingOp[]) {
-        if (!seen.has(opsKey(op))) {
-          store.ops.push(op);
-          seen.add(opsKey(op));
-        }
+        const key = opsKey(op);
+        // An op retired here stays retired: re-admitting it from disk would
+        // replay a destructive write a second time.
+        if (seen.has(key) || retired[key]) continue;
+        store.ops.push(op);
+        seen.add(key);
       }
       // The in-memory cache is authoritative. A key absent from it was either
       // never fetched here or deliberately cleared, so it is dropped at the
       // single site that decides. Spreading disk first brought a cleared entry
       // straight back on the next save.
+      //
+      // syncState, netState and stats take the merged view: another session's
+      // retirement, breaker window and accumulated counters are state the disk
+      // holds, and overwriting them with a stale copy erased them.
+      const prior = (disk.syncState ?? {}) as SyncState;
+      const mineState = store.syncState;
+      const quarantined = { ...(prior.quarantined ?? {}), ...(mineState.quarantined ?? {}) };
+      const failures: Record<string, number> = { ...(prior.failures ?? {}) };
+      for (const [id, n] of Object.entries(mineState.failures ?? {})) {
+        failures[id] = Math.max(n, failures[id] ?? 0);
+      }
+      store.syncState = {
+        ...prior,
+        ...mineState,
+        ...(Object.keys(quarantined).length ? { quarantined } : {}),
+        ...(Object.keys(failures).length ? { failures } : {}),
+        backoffUntil: Math.max(prior.backoffUntil ?? 0, mineState.backoffUntil ?? 0),
+        lastAttemptAt: Math.max(prior.lastAttemptAt ?? 0, mineState.lastAttemptAt ?? 0),
+      };
+      const priorNet = (disk.netState ?? {}) as NetState;
+      store.netState = {
+        ...priorNet,
+        ...store.netState,
+        readsBlockedUntil: Math.max(priorNet.readsBlockedUntil ?? 0, store.netState.readsBlockedUntil ?? 0),
+      };
+      const baseStats = disk.stats ?? store.stats;
+      const summed: Store["stats"] = { ...store.stats };
+      for (const [k, v] of Object.entries(baseStats)) {
+        const current = (summed as Record<string, unknown>)[k];
+        // Counters only accumulate, so the larger figure is the true one even
+        // when this session has seen less traffic than the disk copy. String
+        // fields such as the last strategy are left to this session's copy.
+        if (typeof v === "number" && typeof current === "number") {
+          (summed as Record<string, unknown>)[k] = Math.max(current, v);
+        }
+      }
+      store.stats = summed;
     } catch {
       // A parse failure means another process is mid-write; this save wins.
     }

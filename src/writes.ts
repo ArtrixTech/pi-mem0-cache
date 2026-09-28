@@ -4,7 +4,6 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { join } from "node:path";
 import { clampMemory } from "./memory.js";
 import { ENTITY_FILTER_KEYS } from "./types.js";
 import type { ClassifiedRequest, LocalMemory, Store } from "./types.js";
@@ -40,7 +39,11 @@ export function applyLocalWrite(store: Store, req: ClassifiedRequest): Record<st
       const queryScope: Record<string, unknown> = {};
       try {
         for (const [k, v] of new URLSearchParams(req.search ?? "")) {
-          if (ENTITY_FILTER_KEYS.has(k) && v) queryScope[k] = v;
+          // A wildcard is not a scope: mem0 stores a "*"-valued write so no later
+          // read can reach it, the asymmetry behind mem0ai/mem0#6168. The read
+          // path drops it, and passing it through here stored the memory under
+          // an app id that no scoped read matches.
+          if (ENTITY_FILTER_KEYS.has(k) && v && v !== "*") queryScope[k] = v;
         }
       } catch {
         /* malformed query string */
@@ -89,7 +92,13 @@ export function applyLocalWrite(store: Store, req: ClassifiedRequest): Record<st
     }
     case "write-delete": {
       const id = req.memoryId ?? "";
-      if (store.memories[id]) store.memories[id].deleted = true;
+      if (store.memories[id]) {
+        store.memories[id].deleted = true;
+        // The deletion carries a timestamp of its own. Without it a concurrent
+        // update is strictly newer, so the merge reinstates the live record and
+        // the mirror serves a memory the user deleted until the op replays.
+        store.memories[id].updated_at = now;
+      }
       // Cloud ids queue a delete op even when never mirrored — the intent must
       // reach the server. local-* ids purge at sync without ever uploading.
       if (!id.startsWith("local-")) {
@@ -98,7 +107,10 @@ export function applyLocalWrite(store: Store, req: ClassifiedRequest): Record<st
       return { message: "Memory deleted locally (mem0 API unavailable)." };
     }
     case "write-delete-all": {
-      for (const m of Object.values(store.memories)) m.deleted = true;
+      for (const m of Object.values(store.memories)) {
+        m.deleted = true;
+        m.updated_at = now;
+      }
       store.ops.push({ kind: "write-delete-all", query: req.url.search, at: Date.now() });
       return { message: "Memories deleted locally (mem0 API unavailable)." };
     }

@@ -25,18 +25,9 @@
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { KEYCHAIN_SERVICES, readKeyFromKeychain, resolveProviderKey } from "./credentials.js";
-import { execFileSync } from "node:child_process";
-import { join } from "node:path";
-import { LEXICAL_WEIGHT_DEFAULT, recall } from "./recall/fusion.js";
+import { LEXICAL_WEIGHT_DEFAULT } from "./recall/fusion.js";
 import { createDefaultReranker } from "./recall/rerank.js";
 import { parseStrategy, resolveStrategy } from "./recall/plan.js";
-import {
-  clampMemory,
-  harvestMemories,
-  searchLocal,
-  searchLocalScored,
-} from "./memory.js";
-import { classify } from "./request.js";
 import { loadStore, makeSaver } from "./store.js";
 import {
   DEFAULT_REMOTE_READ_INTERVAL_MS,
@@ -47,15 +38,7 @@ import {
   EMBED_PROVIDERS,
   WRAPPED,
 } from "./types.js";
-import type {
-  CachedResponse,
-  ClassifiedRequest,
-  FetchInput,
-  LocalMemory,
-  LocalStrategy,
-  PendingOp,
-  Store,
-} from "./types.js";
+import type { LocalStrategy } from "./types.js";
 import {
   createDefaultEmbedder,
   createEmbedHarness,
@@ -368,6 +351,9 @@ export default function piMem0Cache(pi: ExtensionAPI): void {
         case "clear-all":
           store.cache = {};
           store.memories = {};
+          // Mark the wipe so the save merge treats an empty corpus as this
+          // session's decision and does not restore what the disk still holds.
+          store.wipedAt = Date.now();
           save();
           ctx.ui.notify("mem0-cache: cache and local memories cleared", "info");
           break;

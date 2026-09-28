@@ -1,5 +1,29 @@
 # devlog
 
+## fix(store,sync,writes): make the concurrent-session merge non-destructive
+
+`98c02fd` | 2026-09-28
+
+- **Changes**: Seven defects found by an independent adversarial review of the six-commit batch, each fixed with a regression test (`test/review-findings.test.ts`, 13 tests).
+  - `Store.wipedAt` is set by `/mem0-cache clear-all`, and `mergeFromDisk` bases its result on the disk corpus only when no wipe was recorded. `src/store.ts`, `src/types.ts`, `src/index.ts`.
+  - `loadStore` bumps `updated_at` when it clamps an oversized record, and `mergeFromDisk` prefers an in-memory `overflow` record on a timestamp tie. `src/store.ts`.
+  - A retired op is removed from `store.ops`. `src/sync.ts`. The queue carries its `PendingOp` so retirement can find it.
+  - `mergeFromDisk` unions `syncState.quarantined` and `syncState.failures`, takes the max for `backoffUntil`/`lastAttemptAt`/`readsBlockedUntil`, and takes the max of numeric `stats` counters. `src/store.ts`.
+  - `isPermanentStatus` treats 401, 403 and 404 as transient. `src/sync.ts`.
+  - `applyLocalWrite` drops a `*`-valued entity filter. `src/writes.ts`.
+  - The delete branches bump `updated_at` on the tombstone. `src/writes.ts`.
+  - `noUnusedLocals` enabled, and 21 unused imports/declarations removed across `src` and `test` that the module split left behind. `tsconfig.json`.
+- **Reason**: Every one of these is reachable in ordinary use, and four reproduce the exact failure the merge was written to prevent. Full detail per finding in Notes.
+- **Process**: Ran each finding as an executable probe before touching code (`/tmp/verify-findings.mts`), then wrote the 10 failures as tests against the unmodified tree and confirmed each one failed for the stated reason. One finding did not survive verification — see Notes.
+- **Result**: 245 passed | 4 skipped, `tsc --noEmit` and `--noUnusedLocals` both clean, `madge --circular` clean, contrastive-rhetoric sweep empty. Live store round-trips losslessly at 4462 memories with syncState, stats and cache intact, and the one pending memory uploaded on the first attempt once the backoff was lifted.
+- **Notes**:
+  - Finding 2 was partly wrong: the reviewer predicted the quarantine sidecar grew once per load, and it does not — `appendQuarantine` already skipped a repeated id. The real defect was upstream of that, in the clamp never reaching the disk copy, so every later load re-clamped the same record. The persistence half was correct and is fixed; the sidecar half needed no change.
+  - The clamp and the wipe are the same shape of bug. Both were a local decision that the merge could not distinguish from the absence of one: an empty map read as "not loaded yet", a clamped record read as "same as the disk copy". Each fix records the decision explicitly.
+  - Classifying 401/403 as permanent means three sync runs against a rotated token retire every pending memory. The memory text survives locally, so the damage is a memory that never uploads, recoverable only by hand.
+  - 404 belongs on the same side as the other non-payload failures: the add URL is endpoint-level, so a 404 signals a wrong origin or path, and a genuine server-side duplicate arrives as 200.
+  - The op-retirement defect was invisible because `quarantine()` deleted the failure counter: the counter restarted every third run, so the log line read like a fresh retirement each time.
+  - A retired op is dropped from the queue with no re-queue path. That is deliberate for `write-delete-all`, where a replay is destructive, and it means recovery is a manual edit of the store. Revisit if an op kind appears that is expensive to recreate and safe to replay.
+
 ## fix(sync): touch updated_at when a local memory uploads
 
 `da64021` | 2026-09-28

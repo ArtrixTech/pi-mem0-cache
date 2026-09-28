@@ -4,6 +4,11 @@
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
     "strict": true,
+    // Unused bindings accumulate silently through a module split: the import
+    // stayed behind when its use moved, and the typecheck stayed green because
+    // this flag was off.
+    "noUnusedLocals": true,
+    "noUnusedParameters": false,
     "noEmit": true,
     "allowImportingTsExtensions": true,
     "skipLibCheck": true,

@@ -4,7 +4,6 @@ import { join } from "node:path";
 import { afterAll, describe, expect, it, vi } from "vitest";
 import {
   authFromEnv,
-  createEmbedHarness,
   createInterceptor,
   emptyStore,
   emptyVectorStore,
@@ -15,8 +14,6 @@ import {
   type Embedder,
   type Store,
 } from "../src/index.ts";
-
-const GETALL_URL = "https://api.mem0.ai/v3/memories/";
 
 const auth: CapturedAuth = {
   origin: "https://api.mem0.ai",

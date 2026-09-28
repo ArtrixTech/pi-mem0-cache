@@ -5,7 +5,6 @@
 
 import { recordShadow } from "./shadow.js";
 import { applyLocalWrite, stripInternal } from "./writes.js";
-import { LEXICAL_WEIGHT_DEFAULT, recall } from "./recall/fusion.js";
 import { extractScope, matchesScope } from "./recall/scope.js";
 import { harvestMemories } from "./memory.js";
 import { cacheKey, classify } from "./request.js";

@@ -23,7 +23,6 @@ function mount(run: string, memories: Record<string, unknown>) {
   }) as unknown as typeof fetch;
   globalThis.fetch = realFetch;
 
-  const now = new Date().toISOString();
   writeFileSync(
     storePath,
     JSON.stringify({

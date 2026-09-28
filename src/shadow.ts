@@ -11,7 +11,6 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
-import { join } from "node:path";
 import {
   LEXICAL_WEIGHT_DEFAULT,
   LexicalChannel,
@@ -19,7 +18,7 @@ import {
   type ChannelHit,
 } from "./recall/fusion.js";
 import { extractScope, matchesScope } from "./recall/scope.js";
-import { harvestMemories, searchLocalScored } from "./memory.js";
+import { searchLocalScored } from "./memory.js";
 import { SHADOW_KEEP_LINES, SHADOW_ROTATE_BYTES } from "./types.js";
 import type { ClassifiedRequest, Store } from "./types.js";
 import type { EmbedHarness } from "./embed.js";

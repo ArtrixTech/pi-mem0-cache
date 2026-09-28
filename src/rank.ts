@@ -3,7 +3,6 @@
  * and rank the scope-filtered corpus through it.
  */
 
-import { join } from "node:path";
 import {
   LEXICAL_WEIGHT_DEFAULT,
   LexicalChannel,
@@ -22,13 +21,6 @@ import type { EmbedHarness } from "./embed.js";
 
 // ---------------------------------------------------------------------------
 // Local read strategies
-
-/** Live corpus of a store, as BM25 docs. */
-function liveDocs(store: Store): { id: string; text: string }[] {
-  return Object.values(store.memories)
-    .filter((m) => !m.deleted)
-    .map((m) => ({ id: m.id, text: m.memory }));
-}
 
 /** Resolve an id list back to memories, dropping any that vanished or are
  *  tombstoned between ranking and response. */

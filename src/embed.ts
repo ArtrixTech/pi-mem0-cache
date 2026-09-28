@@ -13,7 +13,6 @@ import {
   writeFileSync,
 } from "node:fs";
 import { dirname } from "node:path";
-import { recall } from "./recall/fusion.js";
 import {
   DEFAULT_EMBED_MODEL,
   DEFAULT_MEM0_CONFIG_PATH,

@@ -3,9 +3,7 @@
  * harvest the full cloud corpus into the mirror.
  */
 
-import { join } from "node:path";
 import { harvestMemories } from "./memory.js";
-import { classify } from "./request.js";
 import { ENTITY_FILTER_KEYS } from "./types.js";
 import type { LocalMemory, PendingOp, Store } from "./types.js";
 import type { CapturedAuth } from "./interceptor.js";
@@ -38,9 +36,15 @@ export const MAX_SYNC_FAILURES = 3;
  * eventually retired, while a transient one keeps its place and arms backoff.
  * Retrying a 400 forever costs a request per run and never converges, and
  * retiring a 500 discards a memory the server would accept moments later.
+ *
+ * Credential and routing failures are transient on purpose. A rotated token or a
+ * wrong origin fails every request alike, so retiring each pending memory after
+ * three runs would empty the queue the moment the environment is briefly wrong.
  */
 function isPermanentStatus(status: number): boolean {
-  if (status === 408 || status === 429) return false; // timeout / rate limited
+  // Timeout, rate limit, auth, and endpoint-level absence describe this run's
+  // environment, and each resolves without the payload changing.
+  if (status === 401 || status === 403 || status === 404 || status === 408 || status === 429) return false;
   if (status >= 500) return false;
   return status >= 400;
 }
@@ -72,6 +76,8 @@ export function createSyncRunner(opts: SyncRunnerOptions) {
       (m) => m.source === "local" && !m.deleted && !store.syncState.quarantined?.[m.id],
     );
   const pendingTotal = () => pendingList().length + store.ops.length;
+  /** Retire an item: record why, and keep the record so a wrongly-retired
+   *  memory can be found and re-queued. */
   const quarantine = (id: string, reason: string): void => {
     store.syncState.quarantined = { ...(store.syncState.quarantined ?? {}), [id]: { reason, at: Date.now() } };
     delete store.syncState.failures?.[id];
@@ -133,7 +139,6 @@ export function createSyncRunner(opts: SyncRunnerOptions) {
         body: JSON.stringify(payload),
       });
       if (!res.ok) {
-        const detail = `HTTP ${res.status}`;
         const bodyText = await res.text().catch(() => "");
         return isPermanentStatus(res.status)
           ? { ok: false, permanent: true, reason: `HTTP ${res.status}${bodyText ? ` ${bodyText.slice(0, 120)}` : ""}` }
@@ -207,7 +212,7 @@ export function createSyncRunner(opts: SyncRunnerOptions) {
     // Replay in the order the writes happened locally: adds (created_at) and
     // queued ops (at) merge into one chronological queue, so a delete-all
     // recorded before a later add replays before it.
-    const queue: { at: number; kind: "add" | "op"; id: string; run: () => Promise<ReplayOutcome> }[] = [
+    const queue: { at: number; kind: "add" | "op"; id: string; op?: PendingOp; run: () => Promise<ReplayOutcome> }[] = [
       ...pending.map((m) => ({
         at: Date.parse(m.created_at) || 0,
         kind: "add" as const,
@@ -217,7 +222,8 @@ export function createSyncRunner(opts: SyncRunnerOptions) {
       ...store.ops.map((op) => ({
         at: op.at,
         kind: "op" as const,
-        id: op.memoryId ?? `op-${op.at}`,
+        id: op.memoryId ?? `op-${op.at}-${op.kind}`,
+        op,
         run: () => replayOp(op, auth),
       })),
     ].sort((a, b) => a.at - b.at);
@@ -241,8 +247,14 @@ export function createSyncRunner(opts: SyncRunnerOptions) {
         // Retire only the item the server refuses. Every item behind it still
         // gets its attempt: one unacceptable payload used to stop the whole
         // queue, which left four ordinary memories unsynced indefinitely.
-        if (item.kind === "add" && notePermanentFailure(item.id, outcome.reason)) retired.push(item.id);
-        else if (item.kind === "op") notePermanentFailure(item.id, outcome.reason);
+        if (notePermanentFailure(item.id, outcome.reason)) {
+          retired.push(item.id);
+          // An op must leave the queue when it is retired. quarantine() records
+          // the id, and only the adds list consults that record, so a retired op
+          // stayed in store.ops and replayed on every run — retiring it changed
+          // nothing while its failure counter restarted each time.
+          if (item.kind === "op") store.ops = store.ops.filter((o) => o !== item.op);
+        }
         continue;
       }
       // Transient: the server is unhappy with the run, not the payload. Stop
