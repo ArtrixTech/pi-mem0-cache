@@ -87,6 +87,10 @@ export interface ShadowEntry {
   /** Query terms BM25 found nowhere in the corpus — a vocabulary-gap signal
    *  that separates "no lexical signal" from "lexical signal misranked". */
   unmatched?: string[];
+  /** The entity filters this read carried. Recorded so a report can stratify by
+   *  scope: accuracy over a project-scoped corpus and accuracy over the whole
+   *  account are different questions. */
+  scope?: Record<string, string>;
   /** Per-channel failures observed while building this entry. */
   channelErrors?: Record<string, string>;
 }
@@ -330,6 +334,7 @@ export async function recordShadow(
     overlap5,
     overlap10,
     mrr,
+    ...(scope && Object.keys(scope).length > 0 ? { scope } : {}),
   };
 
   // BM25 ranking — the new lexical floor, logged on the same entry so the

@@ -47,6 +47,7 @@ import {
 } from "./embed.js";
 import { createInterceptor } from "./interceptor.js";
 import { appendShadowLog, readShadowEntries, summarizeShadow } from "./shadow.js";
+import { buildReport, formatReport } from "./shadow-report.js";
 import {
   authFromEnv,
   createSyncRunner,
@@ -151,10 +152,20 @@ export default function piMem0Cache(pi: ExtensionAPI): void {
 
   pi.registerCommand("mem0-cache", {
     description:
-      "mem0 read cache: /mem0-cache [stats|provider|sync|refresh|clear|clear-all|path|shadow|embed|embed refresh|pull-all]",
+      "mem0 read cache: /mem0-cache [stats|provider|sync|refresh|clear|clear-all|path|shadow|shadow-report [--version X] [--since YYYY-MM-DD]|embed|embed refresh|pull-all]",
     handler: async (args, ctx) => {
       const sub = (args ?? "").trim() || "stats";
-      switch (sub) {
+      // `shadow-report --version X --since YYYY-MM-DD` scopes the accuracy report.
+      const argv = sub.split(/\s+/);
+      const flagValue = (name: string): string | undefined => {
+        const i = argv.indexOf(name);
+        const next = i === -1 ? undefined : argv[i + 1];
+        return next && !next.startsWith("--") ? next : undefined;
+      };
+      const sinceVersion = flagValue("--version");
+      const sinceDate = flagValue("--since");
+      const subName = argv[0] ?? "stats";
+      switch (subName) {
         case "stats": {
           const s = store.stats;
           const localCount = syncer.pendingCount();
@@ -236,6 +247,17 @@ export default function piMem0Cache(pi: ExtensionAPI): void {
                 .join("\n");
           }
           ctx.ui.notify(msg, "info");
+          break;
+        }
+        case "shadow-report": {
+          // Accuracy over the whole log, filterable by build and date, so a
+          // cumulative claim names the code it describes.
+          const entries = readShadowEntries(shadowPath);
+          const report = buildReport(entries, {
+            ...(sinceVersion ? { version: sinceVersion } : {}),
+            ...(sinceDate ? { since: sinceDate } : {}),
+          });
+          ctx.ui.notify(formatReport(report), "info");
           break;
         }
         case "provider": {
@@ -383,6 +405,16 @@ export type {
 export { emptyStore, loadStore, makeSaver } from "./store.js";
 export { classify, isMem0Host } from "./request.js";
 export { clampMemory, harvestMemories, searchLocal, searchLocalScored, tokenize } from "./memory.js";
+export {
+  buildReport,
+  formatAccuracyTable,
+  formatReport,
+  lengthBucket,
+  MIN_COMPARISONS,
+  ndcgAgainstRemote,
+  STRATEGIES,
+} from "./shadow-report.js";
+export type { ShadowReport, StrategyAccuracy, Stratum } from "./shadow-report.js";
 
 export {
   rankLocal,
