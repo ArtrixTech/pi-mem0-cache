@@ -20,7 +20,7 @@
 - **Reason**: The marker suppressed the disk basis for every later save, so a session that cleared twice discarded concurrent writes from other sessions.
 - **Process**: Caught while reviewing the wipe fix I had just written, by asking what the second save of the same session does. The written file is the record of the wipe, so the marker has nothing left to say.
 - **Result**: A second save in the wiping session stays cleared, and later sessions in other processes resume merging normally. 246 tests at the time.
-- **Notes**: The clear site is single (`/mem0-cache clear-all`); `harvestMemories` merges by id rather than replacing the map, which is what makes the empty-map case unambiguous once the marker is consumed.
+- **Notes**: The clear site is single (`/mem0-cache clear-all`); `harvestMemories` merges by id, which is what makes the empty-map case unambiguous once the marker is consumed.
 
 ## fix(store,sync,writes): make the concurrent-session merge non-destructive
 
