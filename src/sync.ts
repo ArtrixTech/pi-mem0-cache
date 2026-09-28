@@ -6,6 +6,7 @@
 import { join } from "node:path";
 import { harvestMemories } from "./memory.js";
 import { classify } from "./request.js";
+import { ENTITY_FILTER_KEYS } from "./types.js";
 import type { LocalMemory, PendingOp, Store } from "./types.js";
 import type { CapturedAuth } from "./interceptor.js";
 
@@ -92,8 +93,39 @@ export function createSyncRunner(opts: SyncRunnerOptions) {
     return false;
   };
 
+  /** Entity keys this client writes under, read from the corpus. Used to repair
+   *  a locally-stored memory whose payload was captured before query-string
+   *  scope was read: the record has text and no entity id, and mem0 rejects any
+   *  request without one. */
+  const corpusScope = (): Record<string, string> => {
+    for (const m of Object.values(store.memories)) {
+      if (m.source === "local") continue;
+      const rec = m as unknown as Record<string, unknown>;
+      const scope: Record<string, string> = {};
+      for (const k of ENTITY_FILTER_KEYS) {
+        const v = rec[k];
+        if (typeof v === "string" && v) scope[k] = v;
+      }
+      if (Object.keys(scope).length > 0) return scope;
+    }
+    return {};
+  };
+
   async function replayAdd(m: LocalMemory, auth: CapturedAuth): Promise<ReplayOutcome> {
-    const payload = { ...(m.addPayload ?? {}), messages: [{ role: "user", content: m.memory }] };
+    const base = { ...(m.addPayload ?? {}) };
+    delete base.messages;
+    const hasEntity = [...ENTITY_FILTER_KEYS].some((k) => {
+      const v = base[k];
+      return typeof v === "string" ? v.length > 0 : v !== undefined && v !== null;
+    });
+    if (!hasEntity) {
+      // Repair from the corpus where possible. With no scope anywhere the
+      // request goes out as captured: the server's answer decides the outcome,
+      // and the record keeps its text either way.
+      const repaired = corpusScope();
+      if (Object.keys(repaired).length > 0) Object.assign(base, repaired);
+    }
+    const payload = { ...base, messages: [{ role: "user", content: m.memory }] };
     try {
       const res = await fetchImpl(`${auth.origin}/v3/memories/add/`, {
         method: "POST",

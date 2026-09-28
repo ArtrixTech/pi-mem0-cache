@@ -174,3 +174,7 @@ export type LocalStrategy =
   /** Dense, then the reranker reorders the pool. Measured joint-best with
    *  fusion+rerank, and the simpler pipeline of the two. */
   | "dense+rerank";
+
+/** Entity-id keys mem0 accepts on a write or filter. A request carrying
+ *  none of them is rejected: "At least one entity ID is required". */
+export const ENTITY_FILTER_KEYS = new Set(["user_id", "agent_id", "app_id", "run_id"]);

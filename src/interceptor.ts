@@ -9,7 +9,7 @@ import { LEXICAL_WEIGHT_DEFAULT, recall } from "./recall/fusion.js";
 import { extractScope, matchesScope } from "./recall/scope.js";
 import { harvestMemories } from "./memory.js";
 import { cacheKey, classify } from "./request.js";
-import { DEFAULT_429_BLOCK_MS } from "./types.js";
+import { DEFAULT_429_BLOCK_MS, ENTITY_FILTER_KEYS } from "./types.js";
 import type {
   CachedResponse,
   ClassifiedRequest,
@@ -26,8 +26,6 @@ import type { ShadowEntry } from "./shadow.js";
 
 // ---------------------------------------------------------------------------
 // Fetch interceptor
-
-export const ENTITY_FILTER_KEYS = new Set(["user_id", "agent_id", "app_id", "run_id"]);
 
 /**
  * Workaround for mem0ai/mem0#6168: mem0's "*" wildcard matches only non-null

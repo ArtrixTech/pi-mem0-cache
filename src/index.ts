@@ -445,7 +445,6 @@ export type {
   VectorStore,
 } from "./embed.js";
 export {
-  ENTITY_FILTER_KEYS,
   createInterceptor,
   extractHeaders,
   normalizeWildcardFilters,
@@ -470,3 +469,4 @@ export type {
   SyncRunnerOptions,
 } from "./sync.js";
 export { KEYCHAIN_SERVICES, readKeyFromKeychain, resolveProviderKey } from "./credentials.js";
+export { applyLocalWrite, stripInternal } from "./writes.js";

@@ -6,6 +6,7 @@
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { clampMemory } from "./memory.js";
+import { ENTITY_FILTER_KEYS } from "./types.js";
 import type { ClassifiedRequest, LocalMemory, Store } from "./types.js";
 
 export function stripInternal(m: LocalMemory): Record<string, unknown> {
@@ -31,6 +32,19 @@ export function applyLocalWrite(store: Store, req: ClassifiedRequest): Record<st
       }
       const memory = contents.join("\n") || "(empty)";
       const id = `local-${randomUUID()}`;
+      // Scope travels in the query string on a v3 add (`?user_id=…&app_id=…`),
+      // which is how the SDK scopes a write. Reading only the body left the
+      // replay payload with no entity id, and mem0 answers such a request with
+      // 400 "At least one entity ID is required", so the memory could never
+      // sync. Body keys are merged first so an explicit body scope wins.
+      const queryScope: Record<string, unknown> = {};
+      try {
+        for (const [k, v] of new URLSearchParams(req.search ?? "")) {
+          if (ENTITY_FILTER_KEYS.has(k) && v) queryScope[k] = v;
+        }
+      } catch {
+        /* malformed query string */
+      }
       // The same bound harvest applies, applied here too. A 250,819-character add
       // payload reached the store through this path, then failed every upload
       // (mem0 rejected it with HTTP 400) and every embedding request.
@@ -43,7 +57,7 @@ export function applyLocalWrite(store: Store, req: ClassifiedRequest): Record<st
         source: "local",
         // The replay payload carries the clamped text, so the upload mem0 accepts
         // matches what the mirror holds.
-        addPayload: { ...addPayload, memory: clamped.text, messages: undefined },
+        addPayload: { ...queryScope, ...addPayload, memory: clamped.text, messages: undefined },
         ...(clamped.overflow ? { overflow: clamped.overflow } : {}),
       } as LocalMemory;
       if (clamped.overflow) store.stats.harvestDropped = (store.stats.harvestDropped ?? 0) + 1;
