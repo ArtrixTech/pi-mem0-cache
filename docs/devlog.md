@@ -1,5 +1,27 @@
 # devlog
 
+## fix(memory): make the quarantine append safe to repeat
+
+`103c0f8` | 2026-09-28
+
+- **Changes**: `appendQuarantine` replaces the exists-then-append pair with a read-merge-rename keyed by id. `src/memory.ts`. Two clamp tests added.
+- **Reason**: The live sidecar held 28 lines for 5 ids. Two duplicates came from concurrent sessions clamping the same record: both read a file without the id, both appended the full original text. The old check compared a JSON substring, so it also depended on the exact serialization.
+- **Process**: Found while auditing the sidecar that the review had flagged. The reviewer predicted growth on every load; that part was wrong, since the check did hold for repeated sequential loads. The real defect was narrower — a lost race, plus 23 lines of this session's test fixtures sitting in the live file.
+- **Result**: 28 lines / 1.9 MB to 2 lines / 52 KB, holding the two real records (21,984 and 29,726 chars, truncated to the 4,000-char cap in the mirror). 248 tests.
+- **Notes**: The quarantined originals are now the only copy, since the mirror keeps the clamped text.
+  - A first test could not exercise the race at all: `clampMemory` writes synchronously, so `Promise.all` over it serializes regardless. Replaced with a test of what the function does guarantee — one entry per id across repeats, other ids preserved.
+  - Cleanup script bug worth remembering: a `.filter` callback pushed ids while the loop pushed lines, so `JSON.parse` received a bare id. It threw before the write and left the file intact; content and line count were verified on both sides of it.
+
+## fix(store): consume the wipe marker on the save that acts on it
+
+`48dbefd` | 2026-09-28
+
+- **Changes**: `mergeFromDisk` deletes `store.wipedAt` as part of the merge that honours it. `src/store.ts`. Two bm25/scope test comments reworded.
+- **Reason**: The marker suppressed the disk basis for every later save, so a session that cleared twice discarded concurrent writes from other sessions.
+- **Process**: Caught while reviewing the wipe fix I had just written, by asking what the second save of the same session does. The written file is the record of the wipe, so the marker has nothing left to say.
+- **Result**: A second save in the wiping session stays cleared, and later sessions in other processes resume merging normally. 246 tests at the time.
+- **Notes**: The clear site is single (`/mem0-cache clear-all`); `harvestMemories` merges by id rather than replacing the map, which is what makes the empty-map case unambiguous once the marker is consumed.
+
 ## fix(store,sync,writes): make the concurrent-session merge non-destructive
 
 `98c02fd` | 2026-09-28
