@@ -16,10 +16,9 @@
  * filter, stratification, and a sample-size gate.
  *
  * THE GROUND-TRUTH CAVEAT
- * The remote ranking is the reference, which makes these figures agreement with
- * the API rather than absolute relevance. A strategy that beats the API on a
- * query scores lower here. The gold set answers the absolute question; this
- * answers the agreement question, and the two are read together.
+ * The remote ranking is the reference, so these figures measure agreement with
+ * the API. The gold set measures absolute relevance. A strategy that beats the
+ * API on a query scores lower here, and the two are read together.
  *
  * READS ONLY PERSISTED ENTRIES
  * Nothing here re-runs retrieval. A stored entry describes the corpus as it was
