@@ -130,6 +130,13 @@ export interface SyncState {
   backoffUntil?: number;
   lastAttemptAt?: number;
   lastResult?: string;
+  /** Permanent-failure counter per item id. An item the server rejects in a way
+   *  that cannot succeed on retry is retired after MAX_SYNC_FAILURES attempts,
+   *  so it stops consuming a request per run. */
+  failures?: Record<string, number>;
+  /** Items retired from the queue, with the reason. Kept so a wrongly-retired
+   *  memory can be found and re-queued instead of vanishing. */
+  quarantined?: Record<string, { reason: string; at: number }>;
 }
 
 export interface NetState {
@@ -180,7 +187,7 @@ export function loadStore(path: string): Store {
     if (!existsSync(path)) return emptyStore();
     const parsed = JSON.parse(readFileSync(path, "utf8")) as Partial<Store>;
     const base = emptyStore();
-    return {
+    const store: Store = {
       version: 1,
       cache: parsed.cache ?? {},
       memories: parsed.memories ?? {},
@@ -189,6 +196,22 @@ export function loadStore(path: string): Store {
       netState: parsed.netState ?? {},
       stats: { ...base.stats, ...(parsed.stats ?? {}) },
     };
+    // Clamp on the way in. clampMemory guards the two write paths, and a record
+    // already sitting in the file passed through every load untouched — so an
+    // oversized memory outlived both its deletion from the corpus and the guard
+    // that had been added to stop it. Loading is the one point every session
+    // passes through.
+    for (const m of Object.values(store.memories)) {
+      if (typeof m?.memory === "string" && m.memory.length > MAX_MEMORY_CHARS) {
+        const clamped = clampMemory(m.memory, m.id);
+        m.memory = clamped.text;
+        if (clamped.overflow) {
+          m.overflow = clamped.overflow;
+          store.stats.harvestDropped = (store.stats.harvestDropped ?? 0) + 1;
+        }
+      }
+    }
+    return store;
   } catch {
     return emptyStore();
   }
@@ -196,17 +219,81 @@ export function loadStore(path: string): Store {
 
 export function makeSaver(store: Store, path: string): () => void {
   let timer: ReturnType<typeof setTimeout> | null = null;
+  let pending = false;
+  /** Merge other processes' writes into this one before overwriting the file.
+   *
+   *  Every pi session loads its own copy of the store and writes the whole file
+   *  back, so a long-lived session's stale copy overwrites anything a newer
+   *  session wrote. That is not hypothetical: a memory deleted here returned to
+   *  the corpus because a session that had loaded it earlier saved afterwards.
+   *  Merging by id and timestamp keeps both sides' work on the disk copy.
+   */
+  const mergeFromDisk = (): Store => {
+    try {
+      if (!existsSync(path)) return store;
+      const disk = JSON.parse(readFileSync(path, "utf8")) as Partial<Store>;
+      if (!disk.memories) return store;
+      const merged: Record<string, LocalMemory> = { ...(disk.memories as Record<string, LocalMemory>) };
+      for (const [id, mine] of Object.entries(store.memories)) {
+        const theirs = merged[id];
+        if (!theirs) {
+          merged[id] = mine;
+          continue;
+        }
+        const mineAt = Date.parse(mine.updated_at ?? mine.created_at ?? "") || 0;
+        const theirsAt = Date.parse(theirs.updated_at ?? theirs.created_at ?? "") || 0;
+        // A tombstone and a live record for the same id: the more recent write
+        // decides, which is what makes a delete survive a concurrent update.
+        if (mineAt > theirsAt) merged[id] = mine;
+        else if (mineAt === theirsAt && mine.deleted) merged[id] = mine;
+      }
+      store.memories = merged;
+      // Ops are additive per process and replay is idempotent, so the union is
+      // the safe join: an op queued elsewhere still replays, and a replayed op
+      // was already removed from its own side.
+      const opsKey = (o: PendingOp) => `${o.kind}|${o.memoryId ?? ""}|${o.at}`;
+      const seen = new Set(store.ops.map(opsKey));
+      for (const op of (disk.ops ?? []) as PendingOp[]) {
+        if (!seen.has(opsKey(op))) {
+          store.ops.push(op);
+          seen.add(opsKey(op));
+        }
+      }
+      store.cache = { ...(disk.cache ?? {}), ...store.cache };
+    } catch {
+      // A parse failure means another process is mid-write; this save wins.
+    }
+    return store;
+  };
   const flush = () => {
+    if (!pending) return;
+    pending = false;
     try {
       mkdirSync(dirname(path), { recursive: true });
+      const merged = mergeFromDisk();
       const tmp = `${path}.tmp`;
-      writeFileSync(tmp, JSON.stringify(store, null, 2));
+      writeFileSync(tmp, JSON.stringify(merged, null, 2));
       renameSync(tmp, path);
     } catch (err) {
       console.warn("[pi-mem0-cache] failed to persist store:", err);
     }
   };
-  return () => {
+  // Flush synchronously when the process is about to leave. The debounce below
+  // is 300ms, and a session that exits inside that window used to lose its last
+  // write entirely — which is how a deleted memory returned to the corpus after
+  // a stale process saved its in-memory copy back over the deletion.
+  const flushNow = () => {
+    if (timer) {
+      clearTimeout(timer);
+      timer = null;
+    }
+    flush();
+  };
+  for (const signal of ["exit", "SIGINT", "SIGTERM"] as const) {
+    process.once(signal, flushNow);
+  }
+  const save = () => {
+    pending = true;
     if (timer) clearTimeout(timer);
     timer = setTimeout(() => {
       timer = null;
@@ -214,6 +301,7 @@ export function makeSaver(store: Store, path: string): () => void {
     }, 300);
     if (typeof timer.unref === "function") timer.unref();
   };
+  return Object.assign(save, { flushNow });
 }
 
 // ---------------------------------------------------------------------------
@@ -1930,17 +2018,45 @@ export interface SyncRunnerOptions {
   fetchImpl: typeof fetch;
   getAuth: () => CapturedAuth | undefined;
   onEvent?: (message: string) => void;
+  /** Called once when an item is retired from the queue after repeated
+   *  permanent failures, so the operator learns a memory did not sync. */
+  onQuarantine?: (id: string, reason: string) => void;
   /** Backoff after a failed sync attempt (default 1h). */
   backoffMs?: number;
 }
+
+/** Attempts before a permanently-rejected item leaves the queue. A payload the
+ *  server answers with 400/404/422 will answer the same way next time, so
+ *  three tries is enough to conclude the answer is final. */
+export const MAX_SYNC_FAILURES = 3;
+
+/**
+ * Whether a rejection can succeed on retry.
+ *
+ * The distinction decides the response: a permanent rejection is counted and
+ * eventually retired, while a transient one keeps its place and arms backoff.
+ * Retrying a 400 forever costs a request per run and never converges, and
+ * retiring a 500 discards a memory the server would accept moments later.
+ */
+function isPermanentStatus(status: number): boolean {
+  if (status === 408 || status === 429) return false; // timeout / rate limited
+  if (status >= 500) return false;
+  return status >= 400;
+}
+
+type ReplayOutcome = { ok: true } | { ok: false; permanent: boolean; reason: string };
 
 export interface SyncResult {
   uploaded: number;
   failed: number;
   skipped: boolean;
-  /** Pending work remaining: local adds + queued ops. */
+  /** Pending work remaining: local adds + queued ops, excluding quarantined. */
   pending: number;
   appliedOps: number;
+  /** Requests attempted in this run. */
+  attempts: number;
+  /** Items retired this run after repeated permanent failures. */
+  quarantined: string[];
 }
 
 const DEFAULT_SYNC_BACKOFF_MS = 60 * 60 * 1000;
@@ -1950,10 +2066,33 @@ export function createSyncRunner(opts: SyncRunnerOptions) {
   const backoffMs = opts.backoffMs ?? DEFAULT_SYNC_BACKOFF_MS;
   let inFlight: Promise<SyncResult> | null = null;
 
-  const pendingList = () => Object.values(store.memories).filter((m) => m.source === "local" && !m.deleted);
+  const pendingList = () =>
+    Object.values(store.memories).filter(
+      (m) => m.source === "local" && !m.deleted && !store.syncState.quarantined?.[m.id],
+    );
   const pendingTotal = () => pendingList().length + store.ops.length;
+  const quarantine = (id: string, reason: string): void => {
+    store.syncState.quarantined = { ...(store.syncState.quarantined ?? {}), [id]: { reason, at: Date.now() } };
+    delete store.syncState.failures?.[id];
+    onEvent?.(`sync: retired ${id} after ${MAX_SYNC_FAILURES} permanent failures (${reason})`);
+    opts.onQuarantine?.(id, reason);
+  };
 
-  async function replayAdd(m: LocalMemory, auth: CapturedAuth): Promise<boolean> {
+  /** Record a permanent failure and retire the item once it has had enough
+   *  attempts. Returns true when this failure retired it. */
+  const notePermanentFailure = (id: string, reason: string): boolean => {
+    const failures = { ...(store.syncState.failures ?? {}) };
+    const count = (failures[id] ?? 0) + 1;
+    failures[id] = count;
+    store.syncState.failures = failures;
+    if (count >= MAX_SYNC_FAILURES) {
+      quarantine(id, reason);
+      return true;
+    }
+    return false;
+  };
+
+  async function replayAdd(m: LocalMemory, auth: CapturedAuth): Promise<ReplayOutcome> {
     const payload = { ...(m.addPayload ?? {}), messages: [{ role: "user", content: m.memory }] };
     try {
       const res = await fetchImpl(`${auth.origin}/v3/memories/add/`, {
@@ -1961,21 +2100,31 @@ export function createSyncRunner(opts: SyncRunnerOptions) {
         headers: { ...auth.headers, "content-type": "application/json" },
         body: JSON.stringify(payload),
       });
-      if (!res.ok) return false;
+      if (!res.ok) {
+        const detail = `HTTP ${res.status}`;
+        const bodyText = await res.text().catch(() => "");
+        return isPermanentStatus(res.status)
+          ? { ok: false, permanent: true, reason: `HTTP ${res.status}${bodyText ? ` ${bodyText.slice(0, 120)}` : ""}` }
+          : { ok: false, permanent: false, reason: `HTTP ${res.status}` };
+      }
       harvestMemories(store, await res.text().catch(() => ""));
       m.source = "observed";
       delete m.addPayload;
-      return true;
+      return { ok: true };
     } catch {
-      return false;
+      return { ok: false, permanent: false, reason: "network error" };
     }
   }
 
   /** Replay one queued write intent. 404 counts as applied: the server-side
    *  goal state (updated/gone) is unreachable because the target is gone —
    *  the mirror converges by dropping its copy. */
-  async function replayOp(op: PendingOp, auth: CapturedAuth): Promise<boolean> {
+  async function replayOp(op: PendingOp, auth: CapturedAuth): Promise<ReplayOutcome> {
     const headers = { ...auth.headers, "content-type": "application/json" };
+    const classify = (res: Response): ReplayOutcome =>
+      isPermanentStatus(res.status)
+        ? { ok: false, permanent: true, reason: `HTTP ${res.status}` }
+        : { ok: false, permanent: false, reason: `HTTP ${res.status}` };
     try {
       if (op.kind === "write-update" && op.memoryId) {
         const res = await fetchImpl(`${auth.origin}/v1/memories/${op.memoryId}/`, {
@@ -1983,21 +2132,21 @@ export function createSyncRunner(opts: SyncRunnerOptions) {
           headers,
           body: op.bodyText ?? "{}",
         });
-        if (!res.ok && res.status !== 404) return false;
+        if (!res.ok && res.status !== 404) return classify(res);
         if (res.status === 404) delete store.memories[op.memoryId];
       } else if (op.kind === "write-delete" && op.memoryId) {
         const res = await fetchImpl(`${auth.origin}/v1/memories/${op.memoryId}/`, { method: "DELETE", headers });
-        if (!res.ok && res.status !== 404) return false;
+        if (!res.ok && res.status !== 404) return classify(res);
         delete store.memories[op.memoryId]; // server-gone: drop the tombstone
       } else if (op.kind === "write-delete-all") {
         const res = await fetchImpl(`${auth.origin}/v1/memories/${op.query ?? ""}`, { method: "DELETE", headers });
-        if (!res.ok && res.status !== 404) return false;
+        if (!res.ok && res.status !== 404) return classify(res);
         for (const m of Object.values(store.memories)) if (m.deleted) delete store.memories[m.id];
       }
       store.ops = store.ops.filter((o) => o !== op);
-      return true;
+      return { ok: true };
     } catch {
-      return false;
+      return { ok: false, permanent: false, reason: "network error" };
     }
   }
 
@@ -2011,42 +2160,73 @@ export function createSyncRunner(opts: SyncRunnerOptions) {
     const pending = pendingList();
     const auth = getAuth();
     if ((pending.length === 0 && store.ops.length === 0) || !auth) {
-      return { uploaded: 0, failed: 0, skipped: true, pending: pendingTotal(), appliedOps: 0 };
+      return { uploaded: 0, failed: 0, skipped: true, pending: pendingTotal(), appliedOps: 0, attempts: 0, quarantined: [] };
     }
     const now = Date.now();
     if (!force && store.syncState.backoffUntil && now < store.syncState.backoffUntil) {
-      return { uploaded: 0, failed: 0, skipped: true, pending: pendingTotal(), appliedOps: 0 };
+      return { uploaded: 0, failed: 0, skipped: true, pending: pendingTotal(), appliedOps: 0, attempts: 0, quarantined: [] };
     }
     store.syncState.lastAttemptAt = now;
 
     // Replay in the order the writes happened locally: adds (created_at) and
     // queued ops (at) merge into one chronological queue, so a delete-all
     // recorded before a later add replays before it.
-    const queue: { at: number; kind: "add" | "op"; run: () => Promise<boolean> }[] = [
-      ...pending.map((m) => ({ at: Date.parse(m.created_at) || 0, kind: "add" as const, run: () => replayAdd(m, auth) })),
-      ...store.ops.map((op) => ({ at: op.at, kind: "op" as const, run: () => replayOp(op, auth) })),
+    const queue: { at: number; kind: "add" | "op"; id: string; run: () => Promise<ReplayOutcome> }[] = [
+      ...pending.map((m) => ({
+        at: Date.parse(m.created_at) || 0,
+        kind: "add" as const,
+        id: m.id,
+        run: () => replayAdd(m, auth),
+      })),
+      ...store.ops.map((op) => ({
+        at: op.at,
+        kind: "op" as const,
+        id: op.memoryId ?? `op-${op.at}`,
+        run: () => replayOp(op, auth),
+      })),
     ].sort((a, b) => a.at - b.at);
 
     let uploaded = 0;
     let appliedOps = 0;
     let failed = 0;
+    let attempts = 0;
+    const retired: string[] = [];
+    let sawTransient = false;
     for (const item of queue) {
-      if (await item.run()) {
+      attempts++;
+      const outcome = await item.run();
+      if (outcome.ok) {
         if (item.kind === "add") uploaded++;
         else appliedOps++;
         continue;
       }
       failed++;
+      if (outcome.permanent) {
+        // Retire only the item the server refuses. Every item behind it still
+        // gets its attempt: one unacceptable payload used to stop the whole
+        // queue, which left four ordinary memories unsynced indefinitely.
+        if (item.kind === "add" && notePermanentFailure(item.id, outcome.reason)) retired.push(item.id);
+        else if (item.kind === "op") notePermanentFailure(item.id, outcome.reason);
+        continue;
+      }
+      // Transient: the server is unhappy with the run, not the payload. Stop
+      // here and back off rather than issuing the rest against a failing host.
+      sawTransient = true;
       store.syncState.backoffUntil = Date.now() + backoffMs;
-      onEvent?.("sync paused after a failed replay; retrying after backoff");
+      onEvent?.(`sync paused after a failed replay; retrying after backoff`);
       break;
     }
-    store.syncState.lastResult = `uploaded ${uploaded}, ops applied ${appliedOps}, failed ${failed}, pending ${pendingTotal()}`;
+    if (sawTransient) {
+      // cleared below only when nothing transient happened
+    } else if (uploaded > 0 || appliedOps > 0) {
+      store.syncState.backoffUntil = 0;
+    }
+    store.syncState.lastResult = `uploaded ${uploaded}, ops applied ${appliedOps}, failed ${failed}, pending ${pendingTotal()}${retired.length ? `, retired ${retired.length}` : ""}`;
     save();
     if (uploaded > 0 || appliedOps > 0 || failed > 0) {
       onEvent?.(`sync: ${store.syncState.lastResult}`);
     }
-    return { uploaded, failed, skipped: false, pending: pendingTotal(), appliedOps };
+    return { uploaded, failed, skipped: false, pending: pendingTotal(), appliedOps, attempts, quarantined: retired };
   }
 
   /** Fire-and-forget; dedupes concurrent runs. Returns null when nothing to do. */
@@ -2054,7 +2234,7 @@ export function createSyncRunner(opts: SyncRunnerOptions) {
     if (inFlight) return inFlight;
     if (pendingList().length === 0 && store.ops.length === 0) return null;
     inFlight = sync(false)
-      .catch(() => ({ uploaded: 0, failed: 0, skipped: true, pending: pendingTotal(), appliedOps: 0 }))
+      .catch(() => ({ uploaded: 0, failed: 0, skipped: true, pending: pendingTotal(), appliedOps: 0, attempts: 0, quarantined: [] }))
       .finally(() => {
         inFlight = null;
       });
