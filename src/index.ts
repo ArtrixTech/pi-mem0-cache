@@ -23,11 +23,9 @@
  * in the order they were applied.
  */
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import {
   LEXICAL_WEIGHT_DEFAULT,
@@ -38,460 +36,72 @@ import {
   type FusedHit,
   type RecallChannel,
 } from "./recall/fusion.js";
-import { createDefaultReranker, type RerankFn } from "./recall/rerank.js";
+import { createDefaultReranker } from "./recall/rerank.js";
 import { parseStrategy, resolveStrategy } from "./recall/plan.js";
 import { extractScope, filterByScope, matchesScope, type ScopeFilters } from "./recall/scope.js";
+import { clampMemory, harvestMemories, searchLocal, searchLocalScored } from "./memory.js";
+import { cacheKey, classify } from "./request.js";
+import { loadStore, makeSaver } from "./store.js";
+import {
+  DEFAULT_429_BLOCK_MS,
+  DEFAULT_EMBED_MODEL,
+  DEFAULT_MEM0_CONFIG_PATH,
+  DEFAULT_REMOTE_READ_INTERVAL_MS,
+  DEFAULT_SHADOW_PATH,
+  DEFAULT_STORE_PATH,
+  DEFAULT_TTL_MS,
+  DEFAULT_VECTORS_PATH,
+  EMBED_BATCH_CHARS,
+  EMBED_BATCH_SIZE,
+  EMBED_COOLDOWN_MS,
+  EMBED_MAX_BATCHES_PER_CALL,
+  EMBED_PROVIDERS,
+  MAX_FALLBACK_RESULTS,
+  SHADOW_KEEP_LINES,
+  SHADOW_ROTATE_BYTES,
+  WRAPPED,
+} from "./types.js";
+import type {
+  CachedResponse,
+  ClassifiedRequest,
+  FetchInput,
+  LocalMemory,
+  LocalStrategy,
+  PendingOp,
+  Store,
+} from "./types.js";
 
-const DEFAULT_STORE_PATH = join(homedir(), ".pi", "agent", "mem0-cache.json");
-const DEFAULT_TTL_MS = 24 * 60 * 60 * 1000;
-const DEFAULT_REMOTE_READ_INTERVAL_MS = 60 * 60 * 1000;
-const DEFAULT_429_BLOCK_MS = 5 * 60 * 1000;
-const DEFAULT_SHADOW_PATH = join(homedir(), ".pi", "agent", "mem0-shadow.jsonl");
-const SHADOW_ROTATE_BYTES = 4 * 1024 * 1024;
-const SHADOW_KEEP_LINES = 2000;
-const DEFAULT_VECTORS_PATH = join(homedir(), ".pi", "agent", "mem0-vectors.json");
-const DEFAULT_MEM0_CONFIG_PATH = join(homedir(), ".pi", "agent", "mem0-config.json");
-const DEFAULT_EMBED_MODEL = "jina-embeddings-v5-text-nano";
-/** Providers the embedding layer can talk to. All are OpenAI-compatible. */
-export const EMBED_PROVIDERS: Record<string, { endpoint: string; keyEnv: string; model: string }> = {
-  jina: {
-    endpoint: "https://api.jina.ai/v1/embeddings",
-    keyEnv: "JINA_API_KEY",
-    model: "jina-embeddings-v5-text-nano",
-  },
-  openrouter: {
-    endpoint: "https://openrouter.ai/api/v1/embeddings",
-    keyEnv: "OPENROUTER_API_KEY",
-    model: "qwen/qwen3-embedding-8b",
-  },
-};
-const EMBED_COOLDOWN_MS = 60 * 1000;
-/** Inputs per embedding request, and the character budget that caps a larger
- *  batch. 64 x ~250 chars is roughly 4K tokens: large enough to be efficient,
- *  small enough to finish inside the per-request timeout. A batch is closed at
- *  whichever limit is reached first, so a run of unusually long memories produces
- *  more, smaller requests rather than one oversized one. */
-const EMBED_BATCH_SIZE = Number(process.env.MEM0_EMBED_BATCH_SIZE) > 0 ? Number(process.env.MEM0_EMBED_BATCH_SIZE) : 64;
-const EMBED_BATCH_CHARS = 16_000;
-/** Batches per `ensure()` call. 8 x 64 inputs is 512 memories, roughly 75s at ~9s
- *  per batch. Bounded so a first backfill never blocks a session for minutes; the
- *  next call resumes from the sidecar. Raise with MEM0_EMBED_MAX_BATCHES. */
-const EMBED_MAX_BATCHES_PER_CALL = Number(process.env.MEM0_EMBED_MAX_BATCHES) > 0 ? Number(process.env.MEM0_EMBED_MAX_BATCHES) : 8;
-const WRAPPED = Symbol.for("pi-mem0-cache.wrapped");
-const MAX_FALLBACK_RESULTS = 10;
-/** Harvest guard: memories longer than this are truncated. A single 250K-char
- *  terminal paste once made up 23% of the corpus and poisoned both the keyword
- *  ranking and the embedding mean-pooling. Override with MEM0_MAX_MEMORY_CHARS. */
-export const MAX_MEMORY_CHARS =
-  Number(process.env.MEM0_MAX_MEMORY_CHARS) > 0 ? Number(process.env.MEM0_MAX_MEMORY_CHARS) : 4000;
-const DEFAULT_QUARANTINE_PATH = join(homedir(), ".pi", "agent", "mem0-quarantine.jsonl");
+/**
+ * pi-mem0-cache
+ *
+ * Wraps globalThis.fetch and intercepts calls to api.mem0.ai:
+ * - Reads (search / getAll / get / history) are cached to disk with a 24h TTL.
+ * - On API failure (quota exhausted, network down, 4xx/5xx), reads fall back
+ *   to the stale cache entry, then to a local memory store.
+ * - A 429 response arms a breaker (duration from retry-after): while armed,
+ *   reads are answered locally without touching the API.
+ * - A freshness gate limits remote reads to one per remoteReadIntervalMs
+ *   (default 1h); /mem0-cache refresh resets it explicitly.
+ * - Writes that fail against the API are applied to the local store instead.
+ * - A shadow logger records local-vs-remote search agreement for every search
+ *   miss (~/.pi/agent/mem0-shadow.jsonl). Purely observational.
+ * - An embedding recall layer (Jina, OpenAI-compatible /v1/embeddings) ranks
+ *   the local mirror semantically for gated/fallback reads and is shadow-logged
+ *   next to the keyword ranking.
+ *
+ * Successful remote writes echo into the mirror (delete/update/delete-all
+ * propagate; adds harvest from the response) and invalidate the read cache.
+ * Writes that fall back locally are queued: adds replay on sync from their
+ * original payload; update/delete/delete-all intents replay from an op log
+ * in the order they were applied.
+ */
 
-/** Optional metadata attached to a harvested memory whose text was truncated. */
-export interface MemoryOverflow {
-  originalChars: number;
-  truncatedAt: number;
-}
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-interface CachedResponse {
-  status: number;
-  body: string;
-  savedAt: number;
-}
-
-export interface LocalMemory {
-  id: string;
-  memory: string;
-  created_at: string;
-  updated_at: string;
-  deleted?: boolean;
-  source: "local" | "observed";
-  /** Original /v3/memories/add/ payload (minus `messages`) captured when the
-   *  write fell back locally — replayed verbatim on sync so scope params
-   *  (user_id, app_id, …) survive. */
-  addPayload?: Record<string, unknown>;
-  /** Present when the harvested text exceeded MAX_MEMORY_CHARS. */
-  overflow?: MemoryOverflow;
-  [key: string]: unknown;
-}
-
-/** A write intent captured while the API was unavailable, replayed verbatim
- *  on sync. Adds are not ops — they replay from LocalMemory.addPayload. */
-export interface PendingOp {
-  kind: "write-update" | "write-delete" | "write-delete-all";
-  memoryId?: string;
-  /** Original update body, replayed verbatim. */
-  bodyText?: string;
-  /** Original delete-all query string, so scope params survive the replay. */
-  query?: string;
-  at: number;
-}
-
-export interface SyncState {
-  backoffUntil?: number;
-  lastAttemptAt?: number;
-  lastResult?: string;
-  /** Permanent-failure counter per item id. An item the server rejects in a way
-   *  that cannot succeed on retry is retired after MAX_SYNC_FAILURES attempts,
-   *  so it stops consuming a request per run. */
-  failures?: Record<string, number>;
-  /** Items retired from the queue, with the reason. Kept so a wrongly-retired
-   *  memory can be found and re-queued instead of vanishing. */
-  quarantined?: Record<string, { reason: string; at: number }>;
-}
-
-export interface NetState {
-  /** Reads skip the network until this time (armed by a 429's retry-after). */
-  readsBlockedUntil?: number;
-  /** Last successful remote read — the freshness gate's reference point. */
-  lastRemoteReadAt?: number;
-}
-
-export interface Store {
-  version: 1;
-  cache: Record<string, CachedResponse>;
-  memories: Record<string, LocalMemory>;
-  ops: PendingOp[];
-  syncState: SyncState;
-  netState: NetState;
-  stats: {
-    hits: number;
-    misses: number;
-    passthroughs: number;
-    staleServed: number;
-    fallbacks: number;
-    localWrites: number;
-    gated: number;
-    /** Memories whose text was truncated by the harvest guard. */
-    harvestDropped: number;
-    /** Strategy that served the most recent local read (test mode). */
-    lastStrategy?: LocalStrategy;
-    /** Set when that strategy could not run as requested. */
-    lastStrategyDegraded?: string;
-  };
-}
-
-export function emptyStore(): Store {
-  return {
-    version: 1,
-    cache: {},
-    memories: {},
-    ops: [],
-    syncState: {},
-    netState: {},
-    stats: { hits: 0, misses: 0, passthroughs: 0, staleServed: 0, fallbacks: 0, localWrites: 0, gated: 0, harvestDropped: 0 },
-  };
-}
-
-export function loadStore(path: string): Store {
-  try {
-    if (!existsSync(path)) return emptyStore();
-    const parsed = JSON.parse(readFileSync(path, "utf8")) as Partial<Store>;
-    const base = emptyStore();
-    const store: Store = {
-      version: 1,
-      cache: parsed.cache ?? {},
-      memories: parsed.memories ?? {},
-      ops: parsed.ops ?? [],
-      syncState: parsed.syncState ?? {},
-      netState: parsed.netState ?? {},
-      stats: { ...base.stats, ...(parsed.stats ?? {}) },
-    };
-    // Clamp on the way in. clampMemory guards the two write paths, and a record
-    // already sitting in the file passed through every load untouched — so an
-    // oversized memory outlived both its deletion from the corpus and the guard
-    // that had been added to stop it. Loading is the one point every session
-    // passes through.
-    for (const m of Object.values(store.memories)) {
-      if (typeof m?.memory === "string" && m.memory.length > MAX_MEMORY_CHARS) {
-        const clamped = clampMemory(m.memory, m.id);
-        m.memory = clamped.text;
-        if (clamped.overflow) {
-          m.overflow = clamped.overflow;
-          store.stats.harvestDropped = (store.stats.harvestDropped ?? 0) + 1;
-        }
-      }
-    }
-    return store;
-  } catch {
-    return emptyStore();
-  }
-}
-
-export function makeSaver(store: Store, path: string): () => void {
-  let timer: ReturnType<typeof setTimeout> | null = null;
-  let pending = false;
-  /** Merge other processes' writes into this one before overwriting the file.
-   *
-   *  Every pi session loads its own copy of the store and writes the whole file
-   *  back, so a long-lived session's stale copy overwrites anything a newer
-   *  session wrote. That is not hypothetical: a memory deleted here returned to
-   *  the corpus because a session that had loaded it earlier saved afterwards.
-   *  Merging by id and timestamp keeps both sides' work on the disk copy.
-   */
-  const mergeFromDisk = (): Store => {
-    try {
-      if (!existsSync(path)) return store;
-      const disk = JSON.parse(readFileSync(path, "utf8")) as Partial<Store>;
-      if (!disk.memories) return store;
-      const merged: Record<string, LocalMemory> = { ...(disk.memories as Record<string, LocalMemory>) };
-      for (const [id, mine] of Object.entries(store.memories)) {
-        const theirs = merged[id];
-        if (!theirs) {
-          merged[id] = mine;
-          continue;
-        }
-        const mineAt = Date.parse(mine.updated_at ?? mine.created_at ?? "") || 0;
-        const theirsAt = Date.parse(theirs.updated_at ?? theirs.created_at ?? "") || 0;
-        // A tombstone and a live record for the same id: the more recent write
-        // decides, which is what makes a delete survive a concurrent update.
-        if (mineAt > theirsAt) merged[id] = mine;
-        else if (mineAt === theirsAt && mine.deleted) merged[id] = mine;
-      }
-      store.memories = merged;
-      // Ops are additive per process and replay is idempotent, so the union is
-      // the safe join: an op queued elsewhere still replays, and a replayed op
-      // was already removed from its own side.
-      const opsKey = (o: PendingOp) => `${o.kind}|${o.memoryId ?? ""}|${o.at}`;
-      const seen = new Set(store.ops.map(opsKey));
-      for (const op of (disk.ops ?? []) as PendingOp[]) {
-        if (!seen.has(opsKey(op))) {
-          store.ops.push(op);
-          seen.add(opsKey(op));
-        }
-      }
-      store.cache = { ...(disk.cache ?? {}), ...store.cache };
-    } catch {
-      // A parse failure means another process is mid-write; this save wins.
-    }
-    return store;
-  };
-  const flush = () => {
-    if (!pending) return;
-    pending = false;
-    try {
-      mkdirSync(dirname(path), { recursive: true });
-      const merged = mergeFromDisk();
-      const tmp = `${path}.tmp`;
-      writeFileSync(tmp, JSON.stringify(merged, null, 2));
-      renameSync(tmp, path);
-    } catch (err) {
-      console.warn("[pi-mem0-cache] failed to persist store:", err);
-    }
-  };
-  // Flush synchronously when the process is about to leave. The debounce below
-  // is 300ms, and a session that exits inside that window used to lose its last
-  // write entirely — which is how a deleted memory returned to the corpus after
-  // a stale process saved its in-memory copy back over the deletion.
-  const flushNow = () => {
-    if (timer) {
-      clearTimeout(timer);
-      timer = null;
-    }
-    flush();
-  };
-  for (const signal of ["exit", "SIGINT", "SIGTERM"] as const) {
-    process.once(signal, flushNow);
-  }
-  const save = () => {
-    pending = true;
-    if (timer) clearTimeout(timer);
-    timer = setTimeout(() => {
-      timer = null;
-      flush();
-    }, 300);
-    if (typeof timer.unref === "function") timer.unref();
-  };
-  return Object.assign(save, { flushNow });
-}
-
-// ---------------------------------------------------------------------------
-// Request classification
-
-type FetchInput = string | URL | Request;
-
-interface ClassifiedRequest {
-  url: URL;
-  method: string;
-  bodyText: string | undefined;
-  kind: "read-search" | "read-getall" | "read-get" | "read-history" | "read-other" | "write-add" | "write-update" | "write-delete" | "write-delete-all" | "write-other" | "other";
-  memoryId?: string;
-  query?: string;
-  /** Query string of the original request. The SDK's single-item GETs scope
-   *  through `?user_id=…`. A GET carries no body under fetch, so the query
-   *  string is the sole scope carrier for those reads. */
-  search?: string;
-}
-
-export function isMem0Host(url: URL): boolean {
-  return url.hostname === "api.mem0.ai" || url.hostname.endsWith(".mem0.ai");
-}
-
-export function classify(input: FetchInput, init?: RequestInit): ClassifiedRequest | null {
-  const rawUrl = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
-  let url: URL;
-  try {
-    url = new URL(rawUrl);
-  } catch {
-    return null;
-  }
-  if (!isMem0Host(url)) return null;
-
-  const method = (init?.method ?? (typeof input === "object" && "method" in input ? input.method : "GET")).toUpperCase();
-  const rawBody = init?.body ?? (typeof input === "object" && "body" in input ? (input as Request).body : undefined);
-  const bodyText = typeof rawBody === "string" ? rawBody : undefined;
-  // Bodies that aren't plain strings (streams etc.) — passthrough, don't intercept.
-  if (rawBody !== undefined && bodyText === undefined) return null;
-
-  const path = url.pathname;
-  const search = url.search;
-  // The SDK mixes versions by operation: /v3/ for search + add, /v1/ for
-  // single-item get/update/delete and history. Matching only v1 here silently
-  // sent every v3 single-item operation to the network path.
-  const memoryIdMatch = path.match(/^\/v[13]\/memories\/([^/]+)\/?$/);
-  const historyMatch = path.match(/^\/v[13]\/memories\/([^/]+)\/history\/?$/);
-
-  let parsedBody: Record<string, unknown> | undefined;
-  if (bodyText) {
-    try {
-      parsedBody = JSON.parse(bodyText) as Record<string, unknown>;
-    } catch {
-      /* non-JSON body */
-    }
-  }
-
-  if (method === "GET" && historyMatch) {
-    return { url, method, bodyText, search, kind: "read-history", memoryId: historyMatch[1] };
-  }
-  if (method === "POST" && /^\/v[23]\/memories\/search\/?$/.test(path)) {
-    return { url, method, bodyText, search, kind: "read-search", query: typeof parsedBody?.query === "string" ? parsedBody.query : undefined };
-  }
-  if (method === "POST" && /^\/v3\/memories\/add\/?$/.test(path)) {
-    return { url, method, bodyText, search, kind: "write-add" };
-  }
-  if (method === "POST" && /^\/v3\/memories\/?$/.test(path)) {
-    return { url, method, bodyText, search, kind: "read-getall" };
-  }
-  if (method === "GET" && memoryIdMatch) {
-    return { url, method, bodyText, search, kind: "read-get", memoryId: memoryIdMatch[1] };
-  }
-  if ((method === "PUT" || method === "PATCH") && memoryIdMatch) {
-    return { url, method, bodyText, search, kind: "write-update", memoryId: memoryIdMatch[1] };
-  }
-  if (method === "DELETE" && memoryIdMatch) {
-    return { url, method, bodyText, search, kind: "write-delete", memoryId: memoryIdMatch[1] };
-  }
-  if (method === "DELETE" && /^\/v1\/memories\/?$/.test(path)) {
-    return { url, method, bodyText, kind: "write-delete-all" };
-  }
-  if (method === "GET") {
-    return { url, method, bodyText, kind: "read-other" };
-  }
-  return { url, method, bodyText, kind: "other" };
-}
-
-function cacheKey(req: ClassifiedRequest): string {
-  return `${req.method} ${req.url.pathname}${req.url.search} ${req.bodyText ?? ""}`;
-}
 
 // ---------------------------------------------------------------------------
 // Local memory operations
 
-/** Slice at the cap without leaving a lone surrogate half at the boundary. */
-function truncateSafe(text: string, cap: number): string {
-  const sliced = text.slice(0, cap);
-  const last = sliced.charCodeAt(sliced.length - 1);
-  return last >= 0xd800 && last <= 0xdbff ? sliced.slice(0, -1) : sliced;
-}
-
-/**
- * Enforce the memory size bound, reporting what was cut.
- *
- * Applied on both entry points: harvesting a response and applying a local write.
- * One path without it was enough for a 250,819-character memory to enter the
- * corpus, where it failed every upload (mem0 answered HTTP 400) and every
- * embedding request, blocking the dense channel until it was found.
- *
- * The cut text goes to the quarantine sidecar, so nothing is silently destroyed.
- */
-export function clampMemory(text: string, id: string): { text: string; overflow?: MemoryOverflow } {
-  if (text.length <= MAX_MEMORY_CHARS) return { text };
-  appendQuarantine({ id, chars: text.length, memory: text });
-  return { text: truncateSafe(text, MAX_MEMORY_CHARS), overflow: { originalChars: text.length, truncatedAt: MAX_MEMORY_CHARS } };
-}
-
-/** Append the full original text of a truncated memory to the quarantine
- *  sidecar, so nothing the guard dropped becomes unrecoverable. */
-function appendQuarantine(entry: { id: string; chars: number; memory: string }): void {
-  const path = process.env.MEM0_HARVEST_QUARANTINE_PATH ?? DEFAULT_QUARANTINE_PATH;
-  try {
-    mkdirSync(dirname(path), { recursive: true });
-    appendFileSync(path, `${JSON.stringify(entry)}\n`);
-  } catch (err) {
-    console.warn("[pi-mem0-cache] failed to append quarantine entry:", err);
-  }
-}
-
-export function harvestMemories(store: Store, bodyText: string): void {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(bodyText);
-  } catch {
-    return;
-  }
-  const candidates: unknown[] = Array.isArray(parsed)
-    ? parsed
-    : typeof parsed === "object" && parsed !== null && Array.isArray((parsed as { results?: unknown[] }).results)
-      ? (parsed as { results: unknown[] }).results
-      : [];
-  for (const item of candidates) {
-    if (typeof item !== "object" || item === null) continue;
-    const m = item as Record<string, unknown>;
-    if (typeof m.id !== "string" || typeof m.memory !== "string") continue;
-    const existing = store.memories[m.id];
-    // Never let an observed copy overwrite a local write.
-    if (existing?.source === "local") continue;
-    const clamped = clampMemory(m.memory, m.id);
-    store.memories[m.id] = {
-      ...m,
-      id: m.id,
-      memory: clamped.text,
-      created_at: typeof m.created_at === "string" ? m.created_at : new Date().toISOString(),
-      updated_at: typeof m.updated_at === "string" ? m.updated_at : new Date().toISOString(),
-      deleted: false,
-      source: "observed",
-      ...(clamped.overflow ? { overflow: clamped.overflow } : {}),
-    } as LocalMemory;
-    if (clamped.overflow) store.stats.harvestDropped = (store.stats.harvestDropped ?? 0) + 1;
-  }
-}
-
-export function tokenize(text: string): string[] {
-  return text.toLowerCase().match(/[a-z0-9_]+|[一-鿿＀-￯]/g) ?? [];
-}
-
-export function searchLocalScored(
-  store: Store,
-  query: string,
-  limit = MAX_FALLBACK_RESULTS,
-): { m: LocalMemory; score: number }[] {
-  const tokens = tokenize(query);
-  const all = Object.values(store.memories).filter((m) => !m.deleted);
-  if (tokens.length === 0) return all.slice(0, limit).map((m) => ({ m, score: 0 }));
-  const scored = all
-    .map((m) => {
-      const text = m.memory.toLowerCase();
-      let score = 0;
-      for (const t of tokens) if (text.includes(t)) score++;
-      return { m, score };
-    })
-    .filter((s) => s.score > 0)
-    .sort((a, b) => b.score - a.score);
-  return scored.slice(0, limit);
-}
-
-export function searchLocal(store: Store, query: string, limit = MAX_FALLBACK_RESULTS): LocalMemory[] {
-  return searchLocalScored(store, query, limit).map((s) => s.m);
-}
 
 // ---------------------------------------------------------------------------
 // Local read strategies
@@ -1780,25 +1390,6 @@ export interface InterceptorOptions {
 }
 
 /** How a local (non-network) search read is answered. */
-export type LocalStrategy =
-  /** Resolve the best available pipeline from the measured preference ladder.
-   *  The default: dense+rerank when both work, dense when only embeddings work,
-   *  bm25 when no provider is available. */
-  | "auto"
-  /** Legacy single-character keyword scorer. Kept for A/B and fallback. */
-  | "legacy"
-  /** BM25 + CJK bigram only. The availability floor: needs no provider. */
-  | "bm25"
-  /** Embedding cosine only (whatever the embed harness provides). */
-  | "dense"
-  /** BM25 + dense fused with RRF, the lexical side down-weighted. */
-  | "fusion"
-  /** Fusion, then the reranker reorders the pool. */
-  | "fusion+rerank"
-  /** Dense, then the reranker reorders the pool. Measured joint-best with
-   *  fusion+rerank, and the simpler pipeline of the two. */
-  | "dense+rerank";
-
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
     status,
@@ -2683,3 +2274,20 @@ export default function piMem0Cache(pi: ExtensionAPI): void {
     },
   });
 }
+
+export { EMBED_PROVIDERS, MAX_MEMORY_CHARS } from "./types.js";
+export type {
+  CachedResponse,
+  ClassifiedRequest,
+  FetchInput,
+  LocalMemory,
+  LocalStrategy,
+  MemoryOverflow,
+  NetState,
+  PendingOp,
+  Store,
+  SyncState,
+} from "./types.js";
+export { emptyStore, loadStore, makeSaver } from "./store.js";
+export { classify, isMem0Host } from "./request.js";
+export { clampMemory, harvestMemories, searchLocal, searchLocalScored, tokenize } from "./memory.js";
