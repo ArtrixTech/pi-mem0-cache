@@ -142,6 +142,10 @@ export function createSyncRunner(opts: SyncRunnerOptions) {
       harvestMemories(store, await res.text().catch(() => ""));
       m.source = "observed";
       delete m.addPayload;
+      // The merge that guards against concurrent writers resolves a shared id by
+      // updated_at, and a session that loaded this record earlier holds the
+      // pre-upload copy. Touching the timestamp lets the newer state win.
+      m.updated_at = new Date().toISOString();
       return { ok: true };
     } catch {
       return { ok: false, permanent: false, reason: "network error" };
