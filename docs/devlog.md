@@ -1,5 +1,15 @@
 # devlog
 
+## fix(embed): label network-level failures with the provider name
+
+`06063f3` | 2026-09-30
+
+- **Changes**: `createOpenAiCompatEmbedder` wraps the fetch call and rethrows network-level failures as `${label}: ${message}` with `cause` preserved; `createJinaEmbedder` labels itself `jina` instead of the generic `embeddings`; the two disabled-embed notifications in `index.ts` name the provider system (`./scripts/setup-key.sh openrouter|jina`) in place of JINA_API_KEY alone. Two tests pin the labelled network error and the labelled HTTP error.
+- **Reason**: a live `lastStrategyDegraded` read as `dense (query embedding failed: fetch failed)` with no provider attached, and the operator could not tell whether OpenRouter or Jina had died — the machine runs OpenRouter exclusively, and the bare undici message sent the investigation to the wrong provider first.
+- **Process**: traced the error paths — HTTP errors carried `${label} ${status}` since the dead-balance fix, and only the thrown-fetch path bypassed the label. Checked the resolver order, keychain entries, and the installed copy (already HEAD) before concluding the message itself was the defect.
+- **Result**: typecheck clean, 266 tests (2 new).
+- **Notes**: the live probe that motivated this — keychain OpenRouter key, `qwen/qwen3-embedding-8b` embeddings and `voyageai/rerank-2.5-lite` rerank both answering 200 — is worth repeating when a degraded message appears, since a transient network blip and a dead provider produce the same unlabelled string on older builds.
+
 ## feat(shadow): accuracy report over the whole log, sliced by build and date
 
 `4938a74` | 2026-09-28
