@@ -1,5 +1,15 @@
 # devlog
 
+## fix(ui): report sync and fallback events via pi notifications, not stderr
+
+`bc60188` | 2026-09-30
+
+- **Changes**: `src/index.ts` queues background UI messages (interceptor `onFallback`, sync `onEvent`) and flushes them on `session_start`/`agent_end`: the routine `sync: uploaded X, ...` result renders via `ctx.ui.setStatus("mem0-cache", ...)` as a persistent footer status line; everything else (paused replays, retired memories, read/write fallbacks, degraded strategies) flushes as `ctx.ui.notify(..., "warning")` toasts. `!ctx.hasUI` (headless) falls back to stderr. `README.md` wording updated; `test/ui-feed.test.ts` (3 tests) pins queue→flush, footer-vs-toast routing, and the headless path; three entry tests gained an `on` stub in their pi mocks.
+- **Reason**: `console.warn` from background fetch interception wrote raw bytes into pi's TUI — the `[pi-mem0-cache] sync: uploaded 8, ops applied 6, failed 0, pending 8` line landed inside the input box and corrupted the UI.
+- **Process**: Checked pi's extension docs and `ExtensionUIContext` types: `ctx.ui.notify`/`setStatus` exist only on per-event `ExtensionContext`, so background events (fired outside any handler, from wrapped fetch) cannot reach them directly; the queue-plus-flush-on-`agent_end` pattern mirrors how `pi-auto-compact` confines its UI work to event handlers. Kept stderr for headless mode, where it is the correct channel.
+- **Result**: typecheck clean, 269 tests (3 new). Footer now shows the last sync result persistently; toasts appear at turn end only.
+- **Notes**: routine sync success deliberately stops toasting — the footer line carries it. Module-level `console.warn`s in `store.ts`/`embed.ts`/`memory.ts`/`shadow.ts` (disk-persist failures only) still write stderr; they are rare error paths and rerouting them means threading a reporter through four modules.
+
 ## fix(embed): label network-level failures with the provider name
 
 `06063f3` | 2026-09-30
