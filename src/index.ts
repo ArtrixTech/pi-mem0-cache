@@ -311,7 +311,7 @@ export default function piMem0Cache(pi: ExtensionAPI): void {
         case "embed": {
           if (!embed) {
             ctx.ui.notify(
-              "mem0-cache embed: disabled — set JINA_API_KEY or mem0-config.json jinaApiKey (MEM0_EMBED=0 forces off)",
+              "mem0-cache embed: disabled — no provider key found; add one with ./scripts/setup-key.sh openrouter|jina (MEM0_EMBED=0 forces off)",
               "warning",
             );
             break;
@@ -328,7 +328,7 @@ export default function piMem0Cache(pi: ExtensionAPI): void {
         }
         case "embed refresh": {
           if (!embed) {
-            ctx.ui.notify("mem0-cache embed: disabled — set JINA_API_KEY or mem0-config.json jinaApiKey", "warning");
+            ctx.ui.notify("mem0-cache embed: disabled — no provider key found; add one with ./scripts/setup-key.sh openrouter|jina", "warning");
             break;
           }
           const msg = await embed.refresh();

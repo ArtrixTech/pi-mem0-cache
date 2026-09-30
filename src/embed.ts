@@ -26,7 +26,8 @@ import {
 import type { LocalMemory, Store } from "./types.js";
 
 // ---------------------------------------------------------------------------
-// Embedding recall (Jina): semantic ranking of the local mirror
+// Embedding recall: semantic ranking of the local mirror, over any
+// OpenAI-compatible provider (OpenRouter, Jina, Voyage, Ollama, …)
 
 export interface Embedder {
   model: string;
@@ -107,7 +108,7 @@ export function createJinaEmbedder(
     apiKey,
     model,
     endpoint: process.env.MEM0_EMBED_ENDPOINT ?? "https://api.jina.ai/v1/embeddings",
-    label: "embeddings",
+    label: "jina",
     fetchImpl,
   });
 }
@@ -147,12 +148,19 @@ export function createOpenAiCompatEmbedder(opts: OpenAiCompatEmbedderOptions): E
     async embed(texts: string[]): Promise<number[][]> {
       if (texts.length === 0) return [];
       const input = texts.map((t) => (t.length > maxInputChars ? t.slice(0, maxInputChars) : t));
-      const res = await fetchImpl(opts.endpoint, {
-        method: "POST",
-        headers: { "content-type": "application/json", authorization: `Bearer ${opts.apiKey}` },
-        body: JSON.stringify({ model: opts.model, input }),
-        signal: AbortSignal.timeout(timeoutMs),
-      });
+      let res: Response;
+      try {
+        res = await fetchImpl(opts.endpoint, {
+          method: "POST",
+          headers: { "content-type": "application/json", authorization: `Bearer ${opts.apiKey}` },
+          body: JSON.stringify({ model: opts.model, input }),
+          signal: AbortSignal.timeout(timeoutMs),
+        });
+      } catch (err) {
+        // Network-level failures (DNS, TCP, TLS, timeout) arrive with no status
+        // attached; name the provider so the health report says which one died.
+        throw new Error(`${label}: ${err instanceof Error ? err.message : String(err)}`, { cause: err });
+      }
       if (!res.ok) {
         // Surface the provider's own message: a bare status code is what let a
         // 403 "insufficient balance" sit unnoticed for nine days.

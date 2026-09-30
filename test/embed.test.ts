@@ -7,6 +7,7 @@ import {
   createEmbedHarness,
   createInterceptor,
   createJinaEmbedder,
+  createOpenAiCompatEmbedder,
   emptyStore,
   emptyVectorStore,
   ensureEmbeddings,
@@ -69,6 +70,34 @@ describe("createJinaEmbedder", () => {
     // The status alone is not enough: a dead-balance 403 was swallowed for nine
     // days precisely because the provider's own message never surfaced.
     await expect(embedder.embed(["x"])).rejects.toThrow(/401.*detail/);
+  });
+});
+
+describe("createOpenAiCompatEmbedder", () => {
+  it("labels network-level failures with the provider name", async () => {
+    // A thrown fetch (DNS, TCP, TLS, timeout) carries no status; the label is
+    // the only thing that identifies which configured provider died.
+    const embedder = createOpenAiCompatEmbedder({
+      apiKey: "sk-test",
+      model: "m",
+      endpoint: "https://provider.invalid/v1/embeddings",
+      label: "openrouter",
+      fetchImpl: async () => {
+        throw new Error("fetch failed");
+      },
+    });
+    await expect(embedder.embed(["x"])).rejects.toThrow("openrouter: fetch failed");
+  });
+
+  it("keeps the label on HTTP errors", async () => {
+    const embedder = createOpenAiCompatEmbedder({
+      apiKey: "sk-test",
+      model: "m",
+      endpoint: "https://provider.invalid/v1/embeddings",
+      label: "jina(config)",
+      fetchImpl: async () => okJson({ detail: "insufficient balance" }, 403),
+    });
+    await expect(embedder.embed(["x"])).rejects.toThrow(/jina\(config\) 403:.*insufficient balance/);
   });
 });
 
