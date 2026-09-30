@@ -46,6 +46,7 @@ function mount(run: string, memories: Record<string, unknown>) {
 
   let handler: ((args: string | undefined, ctx: NotifyCtx) => Promise<void>) | undefined;
   piMem0Cache({
+    on: () => {},
     registerCommand: (
       _n: string,
       cmd: { handler: (args: string | undefined, ctx: NotifyCtx) => Promise<void> },

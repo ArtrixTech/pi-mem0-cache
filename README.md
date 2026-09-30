@@ -10,7 +10,7 @@ The extension wraps `globalThis.fetch` inside the pi process and transparently i
 
 - Successful responses are cached to disk with a **24h TTL**. Identical requests within the TTL never touch the network — this alone cuts most repeat-query quota burn, since agents re-run similar memory searches constantly.
 - A **freshness gate** caps remote reads at **one per hour** (`MEM0_CACHE_REMOTE_READ_INTERVAL_MS`, default 1h). Within the window, searches and listings are answered from the cache/local store. `/mem0-cache refresh` clears the gate explicitly.
-- A **429 breaker**: when mem0 answers `429 Usage quota exceeded`, the `retry-after` hint arms a breaker; while armed, reads skip the network entirely. The error body (which names the exhausted quota, e.g. `SEARCH`) is included in the fallback log line.
+- A **429 breaker**: when mem0 answers `429 Usage quota exceeded`, the `retry-after` hint arms a breaker; while armed, reads skip the network entirely. The error body (which names the exhausted quota, e.g. `SEARCH`) is included in the fallback toast.
 - If the API fails (quota exhausted, 4xx/5xx, network down):
   1. A **stale cache entry** is served if one exists, otherwise
   2. A **local memory store** answers the query (keyword-overlap search over every memory ever observed plus all local writes).
@@ -25,6 +25,7 @@ The extension wraps `globalThis.fetch` inside the pi process and transparently i
 - The moment *any* mem0 API call succeeds again (quota refilled, network back), pending writes replay in the background **in the order they happened**: offline `add`s upload via `/v3/memories/add/` with their **original scope payload** (`user_id`, `app_id`, …); offline `update`/`delete`/`delete_all` intents replay verbatim from an op log (PUT/DELETE to the original target, delete-all keeps its original query string).
 - A confirmed-remote write supersedes queued ops for the same target; replay 404s count as applied and the mirror converges to server state (server-gone entries are dropped).
 - Uploaded memories are marked `observed`; local copies that were deleted before ever syncing are purged, as are tombstones whose delete op has replayed.
+- Progress is reported through pi's UI, never stderr: each sync's result (`uploaded X, ops applied Y, failed Z, pending W`) renders as a persistent **footer status line**, and anomalies (paused replays, retired memories, read/write fallbacks) surface as **notification toasts** at the end of the turn. Headless runs keep stderr so logs stay redirectable.
 - Auth headers are captured transparently from the mem0 client's own requests — no configuration needed.
 - On failure mid-sync, the runner backs off for 1h before retrying. Force an immediate attempt with `/mem0-cache sync`.
 

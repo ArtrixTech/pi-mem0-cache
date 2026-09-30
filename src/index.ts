@@ -23,7 +23,7 @@
  * in the order they were applied.
  */
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { KEYCHAIN_SERVICES, readKeyFromKeychain, resolveProviderKey } from "./credentials.js";
 import { LEXICAL_WEIGHT_DEFAULT } from "./recall/fusion.js";
 import { createDefaultReranker } from "./recall/rerank.js";
@@ -108,6 +108,43 @@ export default function piMem0Cache(pi: ExtensionAPI): void {
   const g = globalThis as { fetch?: typeof fetch & { [WRAPPED]?: boolean } };
   const authRef: { current?: CapturedAuth } = {};
   const filtersRef: { current?: Record<string, unknown> } = {};
+
+  // Background events (interceptor fallbacks, sync runs) fire outside any event
+  // handler, so no ExtensionContext exists where they happen. Writing to stderr
+  // there corrupts the TUI (raw bytes land inside the input box), so messages
+  // queue here and flush on the next event that carries a ctx. Routine sync
+  // results replace each other as a footer status line; anomalies surface as
+  // notification toasts. Headless mode has no TUI to corrupt — stderr is the
+  // right channel there.
+  type UiMessage = { text: string; level: "info" | "warning" };
+  const queuedUi: UiMessage[] = [];
+  let latestSyncStatus: string | undefined;
+  const reportEvent = (message: string, level: "info" | "warning"): void => {
+    // `sync: uploaded X, ops applied Y, failed Z, pending W` is current state,
+    // not an incident: it renders as the footer line, overwriting the previous
+    // one. Everything else is an incident and queues as a toast.
+    if (level === "info" && message.startsWith("sync: uploaded")) {
+      latestSyncStatus = message;
+      return;
+    }
+    queuedUi.push({ text: `[mem0-cache] ${message}`, level });
+  };
+  const flushUi = (ctx: ExtensionContext): void => {
+    if (!ctx.hasUI) {
+      if (latestSyncStatus !== undefined) console.warn(`[pi-mem0-cache] ${latestSyncStatus}`);
+      for (const m of queuedUi) console.warn(m.text);
+      queuedUi.length = 0;
+      latestSyncStatus = undefined;
+      return;
+    }
+    if (latestSyncStatus !== undefined) {
+      ctx.ui.setStatus("mem0-cache", latestSyncStatus);
+      latestSyncStatus = undefined;
+    }
+    for (const m of queuedUi.splice(0)) ctx.ui.notify(m.text, m.level);
+  };
+  pi.on("session_start", (_event, ctx) => flushUi(ctx));
+  pi.on("agent_end", (_event, ctx) => flushUi(ctx));
   // Capture the original fetch BEFORE wrapping so the sync runner's replayed
   // adds go straight to the network, bypassing the interceptor.
   const realFetch = g.fetch;
@@ -119,7 +156,7 @@ export default function piMem0Cache(pi: ExtensionAPI): void {
       return realFetch(...args);
     },
     getAuth: () => authRef.current,
-    onEvent: (msg) => console.warn(`[pi-mem0-cache] ${msg}`),
+    onEvent: (msg) => reportEvent(msg, msg.startsWith("sync: uploaded") ? "info" : "warning"),
   });
 
   if (typeof g.fetch === "function" && !g.fetch[WRAPPED]) {
@@ -136,7 +173,7 @@ export default function piMem0Cache(pi: ExtensionAPI): void {
       reranker,
       lexicalWeight,
       testMode,
-      onFallback: (reason) => console.warn(`[pi-mem0-cache] ${reason}`),
+      onFallback: (reason) => reportEvent(reason, "warning"),
       onPassthroughSuccess: () => {
         void syncer.maybeSync();
         void embed?.ensure();

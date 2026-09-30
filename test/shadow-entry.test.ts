@@ -51,7 +51,7 @@ describe("extension entry shadow wiring", () => {
       _name: string,
       cmd: { handler: (args: string | undefined, ctx: NotifyCtx) => Promise<void> },
     ): void => { handler = cmd.handler; };
-    piMem0Cache({ registerCommand } as never);
+    piMem0Cache({ on: () => {}, registerCommand } as never);
 
     const res = await globalThis.fetch(SEARCH_URL, { method: "POST", body: JSON.stringify({ query: "hello" }) });
     expect(res.status).toBe(200);

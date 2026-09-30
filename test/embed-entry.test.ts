@@ -88,7 +88,7 @@ describe("extension entry embedding wiring", () => {
     ): void => {
       handler = cmd.handler;
     };
-    piMem0Cache({ registerCommand } as never);
+    piMem0Cache({ on: () => {}, registerCommand } as never);
 
     // Gated read: keyword would put kw-first first; vectors reverse it.
     const res = await globalThis.fetch(SEARCH_URL, { method: "POST", body: JSON.stringify({ query: "veeam 查询" }) });
@@ -151,7 +151,7 @@ describe("extension entry embedding wiring", () => {
     ): void => {
       handler = cmd.handler;
     };
-    piMem0Cache({ registerCommand } as never);
+    piMem0Cache({ on: () => {}, registerCommand } as never);
 
     const res = await globalThis.fetch(SEARCH_URL, { method: "POST", body: JSON.stringify({ query: "veeam 查询" }) });
     const body = (await res.json()) as { results: { id: string }[] };
