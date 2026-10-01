@@ -4,6 +4,7 @@
  */
 
 import { EmbedHarnessChannel } from "./rank.js";
+import { reportDiagnostic } from "./diagnostics.js";
 import {
   appendFileSync,
   existsSync,
@@ -215,7 +216,7 @@ export function appendShadowLog(
     for (let n = 1; existsSync(target); n++) target = `${base}-${stamp}-${n}.jsonl`;
     renameSync(path, target);
   } catch (err) {
-    console.warn("[pi-mem0-cache] failed to append shadow log:", err);
+    reportDiagnostic("failed to append shadow log", err);
   }
 }
 

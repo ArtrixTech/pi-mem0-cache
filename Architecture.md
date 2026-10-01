@@ -28,6 +28,7 @@
 
 ### Entry
 
+- **`src/diagnostics.ts`** — routes persistence failures through the active extension's process-shared diagnostic reporter and supplies stderr delivery for standalone library callers.
 - **`src/index.ts`** — the pi extension entry: wires the interceptor, sync runner, shadow logger, and `/mem0-cache` command, detects provider capabilities, and re-exports the public surface the tests import.
 
 ### Evaluation (`scripts/`)

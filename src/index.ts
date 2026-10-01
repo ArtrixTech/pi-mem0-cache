@@ -24,6 +24,7 @@
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { reportDiagnostic, setDiagnosticReporter } from "./diagnostics.js";
 import { KEYCHAIN_SERVICES, readKeyFromKeychain, resolveProviderKey } from "./credentials.js";
 import { LEXICAL_WEIGHT_DEFAULT } from "./recall/fusion.js";
 import { createDefaultReranker } from "./recall/rerank.js";
@@ -76,6 +77,13 @@ export function readLexicalWeight(value: string | undefined): number {
 }
 
 export default function piMem0Cache(pi: ExtensionAPI): void {
+  let closed = false;
+  const diagnostics: string[] = [];
+  const releaseDiagnostics = setDiagnosticReporter((message) => {
+    if (diagnostics.includes(message)) return;
+    diagnostics.push(message);
+    if (diagnostics.length > 100) diagnostics.shift();
+  });
   const storePath = process.env.MEM0_CACHE_PATH ?? DEFAULT_STORE_PATH;
   const ttlMs = Number(process.env.MEM0_CACHE_TTL_MS) > 0 ? Number(process.env.MEM0_CACHE_TTL_MS) : DEFAULT_TTL_MS;
   const remoteReadIntervalMs =
@@ -109,27 +117,29 @@ export default function piMem0Cache(pi: ExtensionAPI): void {
   const authRef: { current?: CapturedAuth } = {};
   const filtersRef: { current?: Record<string, unknown> } = {};
 
-  // Background events (interceptor fallbacks, sync runs) fire outside any event
-  // handler, so no ExtensionContext exists where they happen. Writing to stderr
-  // there corrupts the TUI (raw bytes land inside the input box), so messages
-  // queue here and flush on the next event that carries a ctx. Routine sync
-  // results replace each other as a footer status line; anomalies surface as
-  // notification toasts. Headless mode has no TUI to corrupt — stderr is the
-  // right channel there.
+  // Background sync, fallback and persistence diagnostics queue until a host
+  // event supplies a context. Sync state uses the footer; incidents use UI
+  // notifications. Headless events deliver diagnostics through stderr.
   type UiMessage = { text: string; level: "info" | "warning" };
   const queuedUi: UiMessage[] = [];
   let latestSyncStatus: string | undefined;
   const reportEvent = (message: string, level: "info" | "warning"): void => {
-    // `sync: uploaded X, ops applied Y, failed Z, pending W` is current state,
-    // not an incident: it renders as the footer line, overwriting the previous
-    // one. Everything else is an incident and queues as a toast.
+    if (closed) {
+      reportDiagnostic("late background event", message);
+      return;
+    }
+    // Routine sync results replace the current footer state.
     if (level === "info" && message.startsWith("sync: uploaded")) {
       latestSyncStatus = message;
       return;
     }
-    queuedUi.push({ text: `[mem0-cache] ${message}`, level });
+    const text = `[mem0-cache] ${message}`;
+    if (queuedUi.some((entry) => entry.text === text)) return;
+    queuedUi.push({ text, level });
+    if (queuedUi.length > 100) queuedUi.shift();
   };
   const flushUi = (ctx: ExtensionContext): void => {
+    for (const message of diagnostics.splice(0)) reportEvent(message, "warning");
     if (!ctx.hasUI) {
       if (latestSyncStatus !== undefined) console.warn(`[pi-mem0-cache] ${latestSyncStatus}`);
       for (const m of queuedUi) console.warn(m.text);
@@ -145,6 +155,18 @@ export default function piMem0Cache(pi: ExtensionAPI): void {
   };
   pi.on("session_start", (_event, ctx) => flushUi(ctx));
   pi.on("agent_end", (_event, ctx) => flushUi(ctx));
+  pi.on("turn_end", (_event, ctx) => flushUi(ctx));
+  pi.on("input", (_event, ctx) => flushUi(ctx));
+  let installedFetch: typeof fetch | undefined;
+  pi.on("session_shutdown", (_event, ctx) => {
+    embed?.dispose?.();
+    saveVectors.dispose();
+    save.dispose();
+    flushUi(ctx);
+    closed = true;
+    releaseDiagnostics();
+    if (installedFetch && g.fetch === installedFetch) g.fetch = realFetch;
+  });
   // Capture the original fetch BEFORE wrapping so the sync runner's replayed
   // adds go straight to the network, bypassing the interceptor.
   const realFetch = g.fetch;
@@ -181,6 +203,7 @@ export default function piMem0Cache(pi: ExtensionAPI): void {
     }) as typeof fetch & { [WRAPPED]?: boolean };
     wrapped[WRAPPED] = true;
     g.fetch = wrapped;
+    installedFetch = wrapped;
   }
 
   // Warm the vector sidecar at session start: covers mirror drift accumulated

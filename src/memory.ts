@@ -6,6 +6,7 @@
 
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
+import { reportDiagnostic } from "./diagnostics.js";
 import { DEFAULT_QUARANTINE_PATH, MAX_FALLBACK_RESULTS, MAX_MEMORY_CHARS } from "./types.js";
 import type { LocalMemory, MemoryOverflow, Store } from "./types.js";
 
@@ -65,7 +66,7 @@ function appendQuarantine(entry: { id: string; chars: number; memory: string }):
     writeFileSync(tmp, `${[...lines, JSON.stringify(entry)].join("\n")}\n`);
     renameSync(tmp, path);
   } catch (err) {
-    console.warn("[pi-mem0-cache] failed to append quarantine entry:", err);
+    reportDiagnostic("failed to append quarantine entry", err);
   }
 }
 

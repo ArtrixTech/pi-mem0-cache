@@ -1,8 +1,9 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { reportDiagnostic } from "../src/diagnostics.ts";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import piMem0Cache from "../src/index.ts";
+import piMem0Cache, { appendShadowLog, clampMemory, emptyStore, emptyVectorStore, makeSaver, makeVectorSaver } from "../src/index.ts";
 
 const SEARCH_URL = "https://api.mem0.ai/v3/memories/search/";
 const ADD_URL = "https://api.mem0.ai/v3/memories/add/";
@@ -28,10 +29,14 @@ function makeCtx(hasUI: boolean): { ctx: UiCtx; notify: ReturnType<typeof vi.fn>
 
 describe("extension entry UI routing", () => {
   const originalFetch = globalThis.fetch;
+  let currentHandlers: Map<string, EventHandler> | undefined;
   afterEach(() => {
+    currentHandlers?.get("session_shutdown")?.(null, makeCtx(false).ctx);
+    currentHandlers = undefined;
     globalThis.fetch = originalFetch;
     vi.unstubAllEnvs();
     vi.restoreAllMocks();
+    vi.useRealTimers();
   });
 
   // Keep the suite hermetic: no keychain, no embed provider, no reranker.
@@ -39,6 +44,7 @@ describe("extension entry UI routing", () => {
     vi.stubEnv("MEM0_KEYCHAIN", "0");
     vi.stubEnv("MEM0_EMBED", "0");
     vi.stubEnv("MEM0_RERANK", "0");
+    vi.stubEnv("MEM0_CACHE_DIAGNOSTICS_PATH", join(tmp, "late-diagnostics.jsonl"));
   });
 
   function load(
@@ -56,7 +62,7 @@ describe("extension entry UI routing", () => {
     };
     const registerCommand = (): void => {};
     const urls: string[] = [];
-    const inner = (async (input: string | URL | Request, init?: RequestInit) => {
+    const inner = (async (input: string | URL | Request) => {
       const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
       urls.push(url);
       if (url === SEARCH_URL) {
@@ -69,6 +75,7 @@ describe("extension entry UI routing", () => {
     }) as typeof fetch;
     globalThis.fetch = inner;
     piMem0Cache({ on, registerCommand } as never);
+    currentHandlers = handlers;
     return { handlers, urls };
   }
 
@@ -105,6 +112,62 @@ describe("extension entry UI routing", () => {
     expect(setStatus).toHaveBeenCalledWith("mem0-cache", expect.stringMatching(/^sync: uploaded 0, ops applied 0, failed 1, pending 1/));
     expect(notify).toHaveBeenCalledWith(expect.stringContaining("sync paused"), "warning");
     expect(notify).not.toHaveBeenCalledWith(expect.stringContaining("sync: uploaded"), expect.anything());
+  });
+
+  it("routes every persistence failure through the UI feed", async () => {
+    const { handlers } = load(`disk${Date.now()}`);
+    const { ctx, notify } = makeCtx(true);
+    handlers.get("session_start")?.(null, ctx);
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.useFakeTimers();
+    const save = makeSaver(emptyStore(), "/dev/null/store.json");
+    save();
+    makeVectorSaver(emptyVectorStore(), "/dev/null/vectors.json")();
+    vi.advanceTimersByTime(350);
+    vi.stubEnv("MEM0_HARVEST_QUARANTINE_PATH", "/dev/null/quarantine.jsonl");
+    clampMemory("x".repeat(20000), "oversized");
+    appendShadowLog("/dev/null/shadow.jsonl", {} as never);
+    handlers.get("agent_end")?.(null, ctx);
+    expect(warnSpy).not.toHaveBeenCalled();
+    for (const kind of ["persist store", "persist vectors", "quarantine entry", "shadow log"]) {
+      expect(notify).toHaveBeenCalledWith(expect.stringContaining(kind), "warning");
+    }
+    save.dispose();
+  });
+
+  it("releases the fetch wrapper and process listeners on shutdown", () => {
+    const before = ["exit", "SIGINT", "SIGTERM"].map((event) => process.listenerCount(event));
+    const { handlers } = load(`reload${Date.now()}`);
+    const wrapped = globalThis.fetch;
+    handlers.get("session_shutdown")?.(null, makeCtx(true).ctx);
+    expect(globalThis.fetch).not.toBe(wrapped);
+    expect(["exit", "SIGINT", "SIGTERM"].map((event) => process.listenerCount(event))).toEqual(before);
+    load(`reloaded${Date.now()}`);
+    expect(globalThis.fetch).not.toBe(wrapped);
+  });
+
+  it("preserves late shutdown failures in a private diagnostic file", () => {
+    const { handlers } = load(`late${Date.now()}`);
+    handlers.get("session_shutdown")?.(null, makeCtx(true).ctx);
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    reportDiagnostic("late persistence failure", new Error("fixture"));
+    expect(warnSpy).not.toHaveBeenCalled();
+    expect(readFileSync(join(tmp, "late-diagnostics.jsonl"), "utf8")).toContain("late persistence failure: fixture");
+  });
+
+  it("flushes pending vectors on disposal and closes stale writes", () => {
+    vi.useFakeTimers();
+    const path = join(tmp, "disposed-vectors.json");
+    const store = emptyVectorStore();
+    const save = makeVectorSaver(store, path);
+    store.model = "first";
+    save();
+    save.dispose();
+    expect(JSON.parse(readFileSync(path, "utf8")).model).toBe("first");
+    store.model = "stale";
+    save();
+    vi.advanceTimersByTime(500);
+    expect(JSON.parse(readFileSync(path, "utf8")).model).toBe("first");
   });
 
   it("falls back to stderr when the flush context has no UI (headless)", async () => {

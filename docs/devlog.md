@@ -1,5 +1,16 @@
 # devlog
 
+## fix(ui): route persistence diagnostics and close session resources
+
+`HEAD` | 2026-10-01
+
+- **Changes**: Add a process-shared persistence reporter for store, vector, quarantine and shadow failures; deduplicate and bound queued UI warnings; flush through input, turn and session events. Close owned fetch wrappers, process listeners, vector timers and embedding continuation during shutdown. Retain late diagnostics in a private rotating JSONL file.
+- **Reason**: Raw background diagnostics were landing inside the pi input box. Four persistence failure paths remained after the earlier sync-footer change.
+- **User feedback**: Review recent pi records and cover related output paths across enabled extensions.
+- **Process**: A failing regression reproduced four direct console writes. Independent review added shutdown and stale-vector coverage. Full Vitest suite: 273 passed, 4 skipped; TypeScript check: exit 0. A separately installed local stream guard passed 10 unit tests and six actual-CLI PTY configurations with preserved input drafts.
+- **Result**: Interactive diagnostics use pi notifications and footer state. Headless event diagnostics use stderr. Shutdown diagnostics retain a private file channel.
+- **Notes**: Existing processes retain loaded module closures; restart pi after deployment. The local stream guard lives in `~/.pi/agent/packages/pi-terminal-output-guard` and is first in the package configuration.
+
 ## fix(ui): report sync and fallback events via pi notifications, not stderr
 
 `bc60188` | 2026-09-30

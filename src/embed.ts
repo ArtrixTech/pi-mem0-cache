@@ -4,6 +4,7 @@
  */
 
 import { resolveProviderKey } from "./credentials.js";
+import { reportDiagnostic } from "./diagnostics.js";
 import { createHash } from "node:crypto";
 import {
   existsSync,
@@ -73,8 +74,9 @@ export function loadVectorStore(path: string): VectorStore {
   }
 }
 
-export function makeVectorSaver(vecStore: VectorStore, path: string): () => void {
+export function makeVectorSaver(vecStore: VectorStore, path: string): (() => void) & { dispose(): void } {
   let timer: ReturnType<typeof setTimeout> | null = null;
+  let disposed = false;
   const flush = () => {
     try {
       mkdirSync(dirname(path), { recursive: true });
@@ -82,10 +84,11 @@ export function makeVectorSaver(vecStore: VectorStore, path: string): () => void
       writeFileSync(tmp, JSON.stringify(vecStore));
       renameSync(tmp, path);
     } catch (err) {
-      console.warn("[pi-mem0-cache] failed to persist vectors:", err);
+      reportDiagnostic("failed to persist vectors", err);
     }
   };
-  return () => {
+  const save = () => {
+    if (disposed) return;
     if (timer) clearTimeout(timer);
     timer = setTimeout(() => {
       timer = null;
@@ -93,6 +96,16 @@ export function makeVectorSaver(vecStore: VectorStore, path: string): () => void
     }, 300);
     if (typeof timer.unref === "function") timer.unref();
   };
+  save.dispose = () => {
+    if (disposed) return;
+    disposed = true;
+    if (timer) {
+      clearTimeout(timer);
+      timer = null;
+      flush();
+    }
+  };
+  return save;
 }
 
 function textHash(text: string): string {
@@ -373,6 +386,8 @@ export interface EmbedHarness {
   };
   /** Force a full re-embed; returns a human-readable result line. */
   refresh(): Promise<string>;
+  /** Close the harness and release background continuation work. */
+  dispose?(): void;
 }
 
 export function createEmbedHarness(
@@ -381,6 +396,7 @@ export function createEmbedHarness(
   vecStore: VectorStore,
   embedder: Embedder,
 ): EmbedHarness {
+  let disposed = false;
   let cooldownUntil = 0;
   let lastError: string | undefined;
   /** Whether the last failure was persistent (corpus-level) or transient
@@ -412,6 +428,7 @@ export function createEmbedHarness(
    * a full minute.
    */
   const embedQuery = async (query: string): Promise<number[] | null> => {
+    if (disposed) return null;
     const hit = queryCache.get(query);
     if (hit) return hit;
     try {
@@ -434,6 +451,7 @@ export function createEmbedHarness(
   /** Coverage reached by the last ensure, for the status report. */
   let lastProgress: { embedded: number; failedBatches: number; remaining: number } | undefined;
   const ensure = (): Promise<void> => {
+    if (disposed) return Promise.resolve();
     // One in-flight backfill at a time: onPassthroughSuccess fires on every
     // successful mem0 call, and overlapping runs would re-embed the same targets.
     if (ensurePromise) return ensurePromise;
@@ -478,7 +496,7 @@ export function createEmbedHarness(
     return ensurePromise;
   };
   const search = async (query: string): Promise<{ m: LocalMemory; score: number }[] | null> => {
-    if (Date.now() < cooldownUntil) return null;
+    if (disposed || Date.now() < cooldownUntil) return null;
     try {
       await ensure();
       const withVec = Object.values(store.memories).filter((m) => !m.deleted && vecStore.vectors[m.id]);
@@ -507,7 +525,7 @@ export function createEmbedHarness(
     // enabled=false on an empty sidecar would route every read to BM25 for the
     // whole first backfill. A failed call or an active cooldown is what disables
     // it, and `search()` returns null when the corpus genuinely has no vectors.
-    enabled: Date.now() >= cooldownUntil && errorKind !== "persistent",
+    enabled: !disposed && Date.now() >= cooldownUntil && errorKind !== "persistent",
     model: embedder.model,
     vectors: Object.keys(vecStore.vectors).length,
     corpus: Object.values(store.memories).filter((m) => !m.deleted).length,
@@ -516,6 +534,7 @@ export function createEmbedHarness(
     cooldownUntil: cooldownUntil > Date.now() ? cooldownUntil : undefined,
   });
   const refresh = async (): Promise<string> => {
+    if (disposed) return "Embedding harness closed";
     cooldownUntil = 0;
     lastError = undefined;
     vecStore.vectors = {};
@@ -529,7 +548,7 @@ export function createEmbedHarness(
       return `embed failed: ${lastError}`;
     }
   };
-  return { ensure, search, status, refresh };
+  return { ensure, search, status, refresh, dispose: () => { disposed = true; queryCache.clear(); } };
 }
 
 /** Default provider selection, in order: MEM0_EMBED_PROVIDER, then any provider

@@ -6,6 +6,7 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { clampMemory } from "./memory.js";
+import { reportDiagnostic } from "./diagnostics.js";
 import { MAX_MEMORY_CHARS } from "./types.js";
 import type { LocalMemory, NetState, PendingOp, Store, SyncState } from "./types.js";
 
@@ -61,7 +62,7 @@ export function loadStore(path: string): Store {
   }
 }
 
-export function makeSaver(store: Store, path: string): () => void {
+export function makeSaver(store: Store, path: string): (() => void) & { flushNow: () => void; dispose: () => void } {
   let timer: ReturnType<typeof setTimeout> | null = null;
   let pending = false;
   /** Merge other processes' writes into this one before overwriting the file.
@@ -198,7 +199,7 @@ export function makeSaver(store: Store, path: string): () => void {
       writeFileSync(tmp, JSON.stringify(merged, null, 2));
       renameSync(tmp, path);
     } catch (err) {
-      console.warn("[pi-mem0-cache] failed to persist store:", err);
+      reportDiagnostic("failed to persist store", err);
     }
   };
   // Flush synchronously when the process is about to leave. The debounce below
@@ -224,7 +225,13 @@ export function makeSaver(store: Store, path: string): () => void {
     }, 300);
     if (typeof timer.unref === "function") timer.unref();
   };
-  return Object.assign(save, { flushNow });
+  const dispose = () => {
+    flushNow();
+    for (const signal of ["exit", "SIGINT", "SIGTERM"] as const) {
+      process.removeListener(signal, flushNow);
+    }
+  };
+  return Object.assign(save, { flushNow, dispose });
 }
 
 // ---------------------------------------------------------------------------
