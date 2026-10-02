@@ -317,6 +317,20 @@ describe("makeSaver cross-process merge", () => {
     expect(onDisk.ops.map((o) => o.memoryId)).toEqual(["x"]);
   });
 
+  it("drops tombstoned ops at load, so a stale writer cannot bring them back", () => {
+    // A long-lived session holds the pre-fix queue in memory and saves it
+    // back over a cleaned store; the tombstones merge across, and the next
+    // load must not re-admit the ops that copy carried.
+    const dir = mkdtempSync(join(tmpdir(), "mem0-merge-"));
+    const path = join(dir, "store.json");
+    const op = { kind: "write-delete" as const, memoryId: "gone", at: 1000 };
+    const onDisk = emptyStore();
+    onDisk.ops.push(op);
+    onDisk.syncState.opsDone = { [`${op.kind}|${op.memoryId}||${op.at}`]: Date.now() };
+    writeFileSync(path, JSON.stringify(onDisk));
+    expect(loadStore(path).ops).toHaveLength(0);
+  });
+
   it("does not resurrect an applied op from a stale disk copy", async () => {
     // Live failure this pins: six write-delete ops replayed in every sync run
     // for days. Each run applied them (a 404 DELETE counts as applied) and

@@ -31,7 +31,7 @@ export function loadStore(path: string): Store {
       version: 1,
       cache: parsed.cache ?? {},
       memories: parsed.memories ?? {},
-      ops: parsed.ops ?? [],
+      ops: (parsed.ops ?? []).filter((o) => (parsed.syncState?.opsDone ?? {})[opKey(o)] === undefined),
       syncState: parsed.syncState ?? {},
       netState: parsed.netState ?? {},
       stats: { ...base.stats, ...(parsed.stats ?? {}) },

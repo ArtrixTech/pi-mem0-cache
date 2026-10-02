@@ -1,8 +1,16 @@
 # devlog
 
-## feat(sync): attempt queue drain at session start with env-auth fallback
+## fix(sync): drop tombstoned ops at load
 
 `HEAD` | 2026-10-02
+
+- **Changes**: `loadStore` filters disk ops against `syncState.opsDone`, and a test pins the stale-writer path.
+- **Reason**: A long-lived session loaded before the tombstone fix still holds the old queue in memory and saves it back over a cleaned store; the merge preserved the tombstones and the next load re-admitted the ops that stale copy carried, buying one redundant replay per op.
+- **Result**: Tombstoned ops never re-enter memory, regardless of which session wrote the file.
+
+## feat(sync): attempt queue drain at session start with env-auth fallback
+
+`3cea471` | 2026-10-02
 
 - **Changes**: The extension fires `maybeSync()` at load, next to the vector warm-up, and the sync runner's `getAuth` falls back to `MEM0_API_KEY` env auth when no request has been observed yet (the same fallback pull-all already used).
 - **Reason**: Sync only ran after a successful remote passthrough. A session whose reads all came from cache or fallback never triggered one, so locally-queued writes waited for a session that happened to miss the cache — the live queue sat for three days while sessions came and went.
