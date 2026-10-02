@@ -7,7 +7,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "
 import { dirname } from "node:path";
 import { clampMemory } from "./memory.js";
 import { reportDiagnostic } from "./diagnostics.js";
-import { MAX_MEMORY_CHARS } from "./types.js";
+import { MAX_MEMORY_CHARS, OPS_DONE_MAX, opKey } from "./types.js";
 import type { LocalMemory, NetState, PendingOp, Store, SyncState } from "./types.js";
 
 export function emptyStore(): Store {
@@ -130,16 +130,16 @@ export function makeSaver(store: Store, path: string): (() => void) & { flushNow
       }
       store.memories = merged;
       // Ops are additive per process and replay is idempotent, so the union is
-      // the safe join: an op queued elsewhere still replays, and a replayed op
-      // was already removed from its own side.
-      const opsKey = (o: PendingOp) => `${o.kind}|${o.memoryId ?? ""}|${o.query ?? ""}|${o.at}`;
-      const seen = new Set(store.ops.map(opsKey));
-      const retired = store.syncState.quarantined ?? {};
+      // the safe join for an op queued elsewhere. The exception is an op this
+      // (or another) session already finished: the disk copy predates its
+      // removal, and re-admitting it replayed a completed write on every sync
+      // run. opsDone tombstones carry the completion past the merge.
+      const diskSync = (disk.syncState ?? {}) as SyncState;
+      const doneOps = { ...(diskSync.opsDone ?? {}), ...(store.syncState.opsDone ?? {}) };
+      const seen = new Set(store.ops.map(opKey));
       for (const op of (disk.ops ?? []) as PendingOp[]) {
-        const key = opsKey(op);
-        // An op retired here stays retired: re-admitting it from disk would
-        // replay a destructive write a second time.
-        if (seen.has(key) || retired[key]) continue;
+        const key = opKey(op);
+        if (seen.has(key) || doneOps[key] !== undefined) continue;
         store.ops.push(op);
         seen.add(key);
       }
@@ -158,11 +158,21 @@ export function makeSaver(store: Store, path: string): (() => void) & { flushNow
       for (const [id, n] of Object.entries(mineState.failures ?? {})) {
         failures[id] = Math.max(n, failures[id] ?? 0);
       }
+      // Both sides contribute tombstones; a completion either side recorded
+      // suppresses the disk op. Prune the oldest past the cap so the map does
+      // not grow without bound.
+      const opsDone = { ...(prior.opsDone ?? {}), ...(mineState.opsDone ?? {}) };
+      const doneKeys = Object.keys(opsDone);
+      if (doneKeys.length > OPS_DONE_MAX) {
+        doneKeys.sort((a, b) => (opsDone[a] ?? 0) - (opsDone[b] ?? 0));
+        for (const k of doneKeys.slice(0, doneKeys.length - OPS_DONE_MAX)) delete opsDone[k];
+      }
       store.syncState = {
         ...prior,
         ...mineState,
         ...(Object.keys(quarantined).length ? { quarantined } : {}),
         ...(Object.keys(failures).length ? { failures } : {}),
+        ...(Object.keys(opsDone).length ? { opsDone } : {}),
         backoffUntil: Math.max(prior.backoffUntil ?? 0, mineState.backoffUntil ?? 0),
         lastAttemptAt: Math.max(prior.lastAttemptAt ?? 0, mineState.lastAttemptAt ?? 0),
       };

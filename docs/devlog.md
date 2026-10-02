@@ -1,8 +1,19 @@
 # devlog
 
+## fix(sync): tombstone ops that leave the queue so saves cannot resurrect them
+
+`HEAD` | 2026-10-02
+
+- **Changes**: `SyncState.opsDone` records every op that leaves the queue (sync-applied, retired after repeated permanent failures, or dropped by `reconcileOps` on a confirmed remote write), keyed by a shared `opKey()`. The save merge skips disk-side ops listed there and prunes the map past 500 entries. Tests pin the applied, retired, and reconciled resurrection paths.
+- **Reason**: Six `write-delete` ops replayed in every sync run for days. Each run applied them (a 404 DELETE counts as applied) and removed them in memory, and the save merge's disk union pulled them straight back — `lastResult` read `ops applied 6` on every run while the queue never shrank. The quarantine path had the same hole: retirement is keyed by item id while the merge checked the op key, so retired ops resurrected too.
+- **User feedback**: Session-start warnings showed a sync queue stuck since 2026-09-29: `sync paused after a failed replay`, `uploaded 0, ops applied 6, failed 1, pending 14`.
+- **Process**: Reproduced against the live store: the same six fake-id ops (test fixtures, absent from the corpus) replayed each run ahead of 21 pending adds. Full Vitest suite: 279 passed, 4 skipped; tsc clean.
+- **Result**: An op that leaves the queue stays gone across saves and sessions.
+- **Notes**: Tombstone eviction is safe because replay is idempotent: an evicted entry costs at most one extra replay of an already-applied write.
+
 ## fix(ui): route persistence diagnostics and close session resources
 
-`HEAD` | 2026-10-01
+`365edb6` | 2026-10-01
 
 - **Changes**: Add a process-shared persistence reporter for store, vector, quarantine and shadow failures; deduplicate and bound queued UI warnings; flush through input, turn and session events. Close owned fetch wrappers, process listeners, vector timers and embedding continuation during shutdown. Retain late diagnostics in a private rotating JSONL file.
 - **Reason**: Raw background diagnostics were landing inside the pi input box. Four persistence failure paths remained after the earlier sync-footer change.

@@ -5,8 +5,8 @@
 
 import { randomUUID } from "node:crypto";
 import { clampMemory } from "./memory.js";
-import { ENTITY_FILTER_KEYS } from "./types.js";
-import type { ClassifiedRequest, LocalMemory, Store } from "./types.js";
+import { ENTITY_FILTER_KEYS, opKey } from "./types.js";
+import type { ClassifiedRequest, LocalMemory, PendingOp, Store } from "./types.js";
 
 export function stripInternal(m: LocalMemory): Record<string, unknown> {
   const { deleted, source, ...rest } = m;
@@ -149,12 +149,21 @@ export function applyRemoteWriteEcho(store: Store, req: ClassifiedRequest): void
 }
 
 /** A confirmed-remote mutation carries newer state than any op queued offline
- *  for the same target; queued ops for it would replay stale intents. */
+ *  for the same target; queued ops for it would replay stale intents.
+ *  Removed ops are tombstoned like sync-applied ones: the save merge would
+ *  otherwise re-admit them from the stale disk copy. */
 export function reconcileOps(store: Store, req: ClassifiedRequest): void {
+  const drop = (ops: PendingOp[]): void => {
+    for (const op of ops) {
+      store.syncState.opsDone = { ...(store.syncState.opsDone ?? {}), [opKey(op)]: Date.now() };
+    }
+  };
   if (req.kind === "write-delete-all") {
+    drop(store.ops);
     store.ops = [];
   } else if ((req.kind === "write-update" || req.kind === "write-delete") && req.memoryId) {
     const id = req.memoryId;
+    drop(store.ops.filter((o) => o.memoryId === id));
     store.ops = store.ops.filter((o) => o.memoryId !== id);
   }
 }

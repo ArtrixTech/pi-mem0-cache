@@ -100,6 +100,18 @@ export interface PendingOp {
   at: number;
 }
 
+/** Stable identity for a queued write intent. Shared by the save merge and the
+ *  applied-op tombstones, so a key computed at replay time matches the key the
+ *  merge checks. */
+export function opKey(o: PendingOp): string {
+  return `${o.kind}|${o.memoryId ?? ""}|${o.query ?? ""}|${o.at}`;
+}
+
+/** Cap on the applied-op tombstone map. Past it the oldest entries drop out;
+ *  replay is idempotent, so an evicted tombstone costs at most one extra
+ *  replay of an op whose effects are already in place. */
+export const OPS_DONE_MAX = 500;
+
 export interface SyncState {
   backoffUntil?: number;
   lastAttemptAt?: number;
@@ -111,6 +123,11 @@ export interface SyncState {
   /** Items retired from the queue, with the reason. Kept so a wrongly-retired
    *  memory can be found and re-queued. */
   quarantined?: Record<string, { reason: string; at: number }>;
+  /** Ops that left the queue (applied or retired), keyed by opKey and valued
+   *  with the completion time. The save merge skips disk-side ops listed here:
+   *  without it the merge's union pulled a just-applied op straight back from
+   *  the stale disk copy, and every later sync replayed it. */
+  opsDone?: Record<string, number>;
 }
 
 export interface NetState {

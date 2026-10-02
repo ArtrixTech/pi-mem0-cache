@@ -2,8 +2,8 @@ import { describe, expect, it } from "vitest";
 import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createSyncRunner, emptyStore, loadStore, makeSaver, MAX_MEMORY_CHARS } from "../src/index.ts";
-import type { CapturedAuth, LocalMemory, Store } from "../src/index.ts";
+import { createSyncRunner, emptyStore, loadStore, makeSaver, reconcileOps, MAX_MEMORY_CHARS } from "../src/index.ts";
+import type { CapturedAuth, ClassifiedRequest, LocalMemory, Store } from "../src/index.ts";
 
 const auth: CapturedAuth = {
   origin: "https://api.mem0.ai",
@@ -315,5 +315,101 @@ describe("makeSaver cross-process merge", () => {
 
     const onDisk = JSON.parse(readFileSync(path, "utf8")) as Store;
     expect(onDisk.ops.map((o) => o.memoryId)).toEqual(["x"]);
+  });
+
+  it("does not resurrect an applied op from a stale disk copy", async () => {
+    // Live failure this pins: six write-delete ops replayed in every sync run
+    // for days. Each run applied them (a 404 DELETE counts as applied) and
+    // removed them from the in-memory queue, but the save merge unions disk
+    // ops back in and the disk copy still held them — so the next save
+    // resurrected them and the next run replayed them. Every sync result read
+    // "ops applied 6" while the queue never shrank.
+    const dir = mkdtempSync(join(tmpdir(), "mem0-sync-"));
+    const path = join(dir, "store.json");
+    const initial = emptyStore();
+    initial.ops.push({ kind: "write-delete", memoryId: "gone", at: 1000 });
+    writeFileSync(path, JSON.stringify(initial));
+
+    const store = loadStore(path);
+    const save = makeSaver(store, path) as ReturnType<typeof makeSaver> & { flushNow: () => void };
+    save();
+    save.flushNow();
+
+    const gone404 = (async () => new Response("", { status: 404 })) as typeof fetch;
+    const runner = createSyncRunner({ store, save: () => {}, fetchImpl: gone404, getAuth: () => auth });
+    const res = await runner.sync(true);
+    expect(res.appliedOps).toBe(1);
+    expect(store.ops).toHaveLength(0);
+
+    // The disk copy still lists the op; the merge must not pull it back.
+    save();
+    save.flushNow();
+    let onDisk = JSON.parse(readFileSync(path, "utf8")) as Store;
+    expect(onDisk.ops).toHaveLength(0);
+    expect(Object.keys(onDisk.syncState.opsDone ?? {})).toHaveLength(1);
+
+    // A fresh session loads zero ops, and its own save keeps them gone.
+    const fresh = loadStore(path);
+    expect(fresh.ops).toHaveLength(0);
+    const saveFresh = makeSaver(fresh, path) as ReturnType<typeof makeSaver> & { flushNow: () => void };
+    saveFresh();
+    saveFresh.flushNow();
+    onDisk = JSON.parse(readFileSync(path, "utf8")) as Store;
+    expect(onDisk.ops).toHaveLength(0);
+  });
+
+  it("does not resurrect a retired op from a stale disk copy", async () => {
+    // The quarantine path had the same hole: the op left the in-memory queue,
+    // and the merge re-admitted it from disk because the retirement record is
+    // keyed by item id while the merge checked the op key.
+    const dir = mkdtempSync(join(tmpdir(), "mem0-sync-"));
+    const path = join(dir, "store.json");
+    const initial = emptyStore();
+    initial.ops.push({ kind: "write-update", memoryId: "bad", bodyText: "{}", at: 1000 });
+    writeFileSync(path, JSON.stringify(initial));
+
+    const store = loadStore(path);
+    const save = makeSaver(store, path) as ReturnType<typeof makeSaver> & { flushNow: () => void };
+    save();
+    save.flushNow();
+
+    const always400 = (async () => new Response("bad request", { status: 400 })) as typeof fetch;
+    const runner = createSyncRunner({ store, save: () => {}, fetchImpl: always400, getAuth: () => auth, backoffMs: 0 });
+    await runner.sync(true);
+    await runner.sync(true);
+    const third = await runner.sync(true);
+    expect(third.quarantined).toHaveLength(1);
+    expect(store.ops).toHaveLength(0);
+
+    save();
+    save.flushNow();
+    const onDisk = JSON.parse(readFileSync(path, "utf8")) as Store;
+    expect(onDisk.ops).toHaveLength(0);
+
+    const fresh = loadStore(path);
+    expect(fresh.ops).toHaveLength(0);
+    expect(fresh.syncState.quarantined?.bad).toBeDefined();
+  });
+
+  it("does not resurrect an op superseded by a confirmed remote write", () => {
+    // Same merge hole, different removal site: a write-delete that succeeded
+    // remotely makes a queued delete for the same id redundant, and
+    // reconcileOps drops it. Without a tombstone the merge re-admitted it.
+    const dir = mkdtempSync(join(tmpdir(), "mem0-sync-"));
+    const path = join(dir, "store.json");
+    const initial = emptyStore();
+    initial.ops.push({ kind: "write-delete", memoryId: "x", at: 1000 });
+    writeFileSync(path, JSON.stringify(initial));
+
+    const store = loadStore(path);
+    const save = makeSaver(store, path) as ReturnType<typeof makeSaver> & { flushNow: () => void };
+    save();
+    save.flushNow();
+
+    reconcileOps(store, { kind: "write-delete", memoryId: "x" } as ClassifiedRequest);
+    expect(store.ops).toHaveLength(0);
+    save();
+    save.flushNow();
+    expect((JSON.parse(readFileSync(path, "utf8")) as Store).ops).toHaveLength(0);
   });
 });

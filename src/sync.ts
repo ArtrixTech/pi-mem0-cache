@@ -4,7 +4,7 @@
  */
 
 import { harvestMemories } from "./memory.js";
-import { ENTITY_FILTER_KEYS } from "./types.js";
+import { ENTITY_FILTER_KEYS, opKey } from "./types.js";
 import type { LocalMemory, PendingOp, Store } from "./types.js";
 import type { CapturedAuth } from "./interceptor.js";
 
@@ -117,6 +117,12 @@ export function createSyncRunner(opts: SyncRunnerOptions) {
     return {};
   };
 
+  /** Tombstone an op that left the queue, so the save merge does not
+   *  re-admit it from a stale disk copy on the next save. */
+  const markOpDone = (op: PendingOp): void => {
+    store.syncState.opsDone = { ...(store.syncState.opsDone ?? {}), [opKey(op)]: Date.now() };
+  };
+
   async function replayAdd(m: LocalMemory, auth: CapturedAuth): Promise<ReplayOutcome> {
     const base = { ...(m.addPayload ?? {}) };
     delete base.messages;
@@ -185,6 +191,7 @@ export function createSyncRunner(opts: SyncRunnerOptions) {
         for (const m of Object.values(store.memories)) if (m.deleted) delete store.memories[m.id];
       }
       store.ops = store.ops.filter((o) => o !== op);
+      markOpDone(op);
       return { ok: true };
     } catch {
       return { ok: false, permanent: false, reason: "network error" };
@@ -253,7 +260,10 @@ export function createSyncRunner(opts: SyncRunnerOptions) {
           // the id, and only the adds list consults that record, so a retired op
           // stayed in store.ops and replayed on every run — retiring it changed
           // nothing while its failure counter restarted each time.
-          if (item.kind === "op") store.ops = store.ops.filter((o) => o !== item.op);
+          if (item.kind === "op" && item.op) {
+            store.ops = store.ops.filter((o) => o !== item.op);
+            markOpDone(item.op);
+          }
         }
         continue;
       }
