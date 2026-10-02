@@ -12,7 +12,7 @@ import {
   type FusedHit,
   type RecallChannel,
 } from "./recall/fusion.js";
-import { resolveStrategy } from "./recall/plan.js";
+import { resolveStrategy, type StrategyName } from "./recall/plan.js";
 import { filterByScope, matchesScope, type ScopeFilters } from "./recall/scope.js";
 import { searchLocal } from "./memory.js";
 import { MAX_FALLBACK_RESULTS } from "./types.js";
@@ -57,7 +57,7 @@ export async function rankLocal(
     scope?: ScopeFilters;
     /** Fusion weight for the lexical channel; see LEXICAL_WEIGHT_DEFAULT. */
     lexicalWeight?: number;
-    onStrategy?: (info: { strategy: LocalStrategy; degraded?: string; channels: ChannelStatus[] }) => void;
+    onStrategy?: (info: { strategy: LocalStrategy; requested: StrategyName; degraded?: string; channels: ChannelStatus[] }) => void;
   } = {},
   limit = MAX_FALLBACK_RESULTS,
 ): Promise<LocalMemory[]> {
@@ -75,7 +75,7 @@ export async function rankLocal(
   const plan = resolution.plan;
 
   if (plan.strategy === "legacy") {
-    opts.onStrategy?.({ strategy: "legacy", channels: [] });
+    opts.onStrategy?.({ strategy: "legacy", requested: resolution.requested, channels: [] });
     return filterByScope(searchLocal(store, query, limit), opts.scope) as LocalMemory[];
   }
 
@@ -117,16 +117,22 @@ export async function rankLocal(
 
   // Report the strategy that actually answered. A channel that failed mid-call
   // leaves a plan whose name no longer describes what produced the hits, and the
-  // shadow log must record the truth.
+  // shadow log must record the truth. One exception: an empty candidate pool
+  // skips the reranker with every channel healthy — the pipeline answered
+  // exactly as planned (there was simply nothing to reorder), and naming the
+  // un-reranked stage as what "served" invented a degradation with an empty
+  // reason on every zero-result read.
+  const failedChannels = result.status.filter((s) => !s.ok);
+  const rerankSkippedEmpty = plan.rerank && !result.reranked && failedChannels.length === 0;
   const survivors = result.status.filter((s) => s.ok).map((s) => s.name);
-  const served = describeServed(survivors, result.reranked);
+  const served = rerankSkippedEmpty ? plan.strategy : describeServed(survivors, result.reranked);
   const degraded =
     resolution.degraded ??
     (served !== plan.strategy
-      ? `${plan.strategy} served as ${served}: ${result.status.filter((s) => !s.ok).map((s) => `${s.name} (${s.error ?? "failed"})`).join(", ")}`
+      ? `${plan.strategy} served as ${served}: ${failedChannels.map((s) => `${s.name} (${s.error ?? "failed"})`).join(", ")}`
       : undefined);
 
-  opts.onStrategy?.({ strategy: served, ...(degraded ? { degraded } : {}), channels: result.status });
+  opts.onStrategy?.({ strategy: served, requested: resolution.requested, ...(degraded ? { degraded } : {}), channels: result.status });
   const ids = result.hits.map((h) => h.id);
   return materialize(store, ids, limit);
 }

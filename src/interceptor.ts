@@ -141,7 +141,7 @@ export function createInterceptor(
             if (info.degraded) {
               store.stats.lastStrategyDegraded = info.degraded;
               onFallback?.(
-                `local read strategy "${opts.localStrategy ?? "fusion"}" degraded to "${info.strategy}": ${info.degraded}`,
+                `local read strategy "${info.requested}" degraded to "${info.strategy}": ${info.degraded}`,
               );
             }
             const failed = info.channels.filter((c) => !c.ok);

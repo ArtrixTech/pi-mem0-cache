@@ -1,8 +1,18 @@
 # devlog
 
-## fix(sync): tombstone ops that leave the queue so saves cannot resurrect them
+## fix(rank): no degradation warning when an empty pool skips the reranker
 
 `HEAD` | 2026-10-02
+
+- **Changes**: `rankLocal` treats "reranker configured, every channel healthy, zero candidates" as the plan answering as intended instead of naming the un-reranked stage as what served. The interceptor warning names the strategy that was actually requested (from the resolution) instead of a hardcoded `"fusion"` fallback. `test/rank.test.ts` pins the empty-pool silence, a dense-channel failure reason, and a reranker failure reason.
+- **Reason**: Every zero-result local read warned `local read strategy "fusion" degraded to "dense": dense+rerank served as dense: ` — an empty reason and a wrong strategy label. Nothing had degraded: the dense channel answered with zero hits and the reranker had nothing to reorder.
+- **User feedback**: Session-start warnings included the empty-reason degradation line.
+- **Process**: Traced through `recall()`: a reranker skipped on an empty fused pool returns `reranked: false` with all channels ok, so `describeServed` named `dense` against the `dense+rerank` plan and the failed-channels list was empty. Real degradations (channel threw, reranker threw) still warn with their reason.
+- **Result**: Zero-result reads are silent; genuine degradations keep their reasons; the label matches the configured strategy.
+
+## fix(sync): tombstone ops that leave the queue so saves cannot resurrect them
+
+`111507f` | 2026-10-02
 
 - **Changes**: `SyncState.opsDone` records every op that leaves the queue (sync-applied, retired after repeated permanent failures, or dropped by `reconcileOps` on a confirmed remote write), keyed by a shared `opKey()`. The save merge skips disk-side ops listed there and prunes the map past 500 entries. Tests pin the applied, retired, and reconciled resurrection paths.
 - **Reason**: Six `write-delete` ops replayed in every sync run for days. Each run applied them (a 404 DELETE counts as applied) and removed them in memory, and the save merge's disk union pulled them straight back — `lastResult` read `ops applied 6` on every run while the queue never shrank. The quarantine path had the same hole: retirement is keyed by item id while the merge checked the op key, so retired ops resurrected too.
