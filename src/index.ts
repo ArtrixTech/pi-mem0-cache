@@ -177,7 +177,7 @@ export default function piMem0Cache(pi: ExtensionAPI): void {
       if (!realFetch) throw new Error("fetch unavailable");
       return realFetch(...args);
     },
-    getAuth: () => authRef.current,
+    getAuth: () => authRef.current ?? authFromEnv(),
     onEvent: (msg) => reportEvent(msg, msg.startsWith("sync: uploaded") ? "info" : "warning"),
   });
 
@@ -209,6 +209,10 @@ export default function piMem0Cache(pi: ExtensionAPI): void {
   // Warm the vector sidecar at session start: covers mirror drift accumulated
   // before any search traffic has flowed through the interceptor.
   void embed?.ensure();
+  // Drain the offline write queue at session start too: sync otherwise waits
+  // for a passthrough success, which a session of cached reads may never
+  // produce. maybeSync dedupes, respects backoff, and no-ops on an empty queue.
+  void syncer.maybeSync();
 
   pi.registerCommand("mem0-cache", {
     description:

@@ -1,8 +1,18 @@
 # devlog
 
-## fix(rank): no degradation warning when an empty pool skips the reranker
+## feat(sync): attempt queue drain at session start with env-auth fallback
 
 `HEAD` | 2026-10-02
+
+- **Changes**: The extension fires `maybeSync()` at load, next to the vector warm-up, and the sync runner's `getAuth` falls back to `MEM0_API_KEY` env auth when no request has been observed yet (the same fallback pull-all already used).
+- **Reason**: Sync only ran after a successful remote passthrough. A session whose reads all came from cache or fallback never triggered one, so locally-queued writes waited for a session that happened to miss the cache — the live queue sat for three days while sessions came and went.
+- **User feedback**: 21 adds and 6 ops pending since 2026-09-29 with sessions running daily.
+- **Process**: `maybeSync` dedupes concurrent runs, respects the backoff window, and no-ops on an empty queue, so the new trigger costs nothing when there is nothing to do.
+- **Result**: A session that starts with a healthy network drains the queue immediately instead of waiting for a cache miss.
+
+## fix(rank): no degradation warning when an empty pool skips the reranker
+
+`559977b` | 2026-10-02
 
 - **Changes**: `rankLocal` treats "reranker configured, every channel healthy, zero candidates" as the plan answering as intended instead of naming the un-reranked stage as what served. The interceptor warning names the strategy that was actually requested (from the resolution) instead of a hardcoded `"fusion"` fallback. `test/rank.test.ts` pins the empty-pool silence, a dense-channel failure reason, and a reranker failure reason.
 - **Reason**: Every zero-result local read warned `local read strategy "fusion" degraded to "dense": dense+rerank served as dense: ` — an empty reason and a wrong strategy label. Nothing had degraded: the dense channel answered with zero hits and the reranker had nothing to reorder.
